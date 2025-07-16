@@ -1,14 +1,11 @@
 -- ------------------------------------------------------------
 -- DRY‑RUN / MINI‑LOAD: long → wide with struct‑wrapped arrays
 -- ------------------------------------------------------------
--- ▸ Adjust project & dataset once here
-DECLARE project STRING DEFAULT 'stl-datascience';
-DECLARE dataset STRING DEFAULT 'tomtom';
 
 -- ------------------------------------------------------------
--- 1) Re‑create wide table with safe element type (no NULL elems)
+-- 1) Re‑create wide table (struct‑wrapped arrays ⇒ no NULL elem error)
 -- ------------------------------------------------------------
-CREATE OR REPLACE TABLE `${project}.${dataset}.tt_bulk_test_geohash6_wide` (
+CREATE OR REPLACE TABLE `stl-datascience.tomtom.tt_bulk_test_geohash6_wide` (
   geohash                STRING,
   dsegId                 INT64,
   dateHour               TIMESTAMP,
@@ -27,67 +24,69 @@ PARTITION BY DATE_TRUNC(dateHour, MONTH)
 CLUSTER BY geohash, dsegId, dateHour;
 
 -- ------------------------------------------------------------
--- 2) Mini‑load: sample ≤ 0.2 % of storage pages (cheap)
---    Keeps full 4‑bin grouping for whatever hours land in sample
+-- 2) Mini‑load: reference the source table **only once** with
+--    TABLESAMPLE to avoid the “sampling not supported” error.
 -- ------------------------------------------------------------
-INSERT INTO `${project}.${dataset}.tt_bulk_test_geohash6_wide`
-WITH sample_keys AS (
-  SELECT DISTINCT geohash, dsegId, TIMESTAMP_TRUNC(dateHour, HOUR) AS hour_ts
-  FROM   `${project}.${dataset}.tt_bulk_test_geohash6`
-  TABLESAMPLE SYSTEM (0.2 PERCENT)          -- ≈ few GB scan even on TB table
-  LIMIT 100                                 -- safety cap (≈ ≤ 400 rows after grp)
+INSERT INTO `stl-datascience.tomtom.tt_bulk_test_geohash6_wide`
+WITH sample_rows AS (
+  SELECT
+    geohash,
+    dsegId,
+    TIMESTAMP_TRUNC(dateHour, HOUR)                 AS dateHour,
+    DIV(EXTRACT(MINUTE FROM dateHour), 15)          AS bin_idx,   -- 0‑3
+    sampleSize,
+    averageSpeedMetersPerHour,
+    harmonicAverageSpeedMetersPerHour,
+    medianSpeedMetersPerHour,
+    standardDeviationSpeedMetersPerHour,
+    speedPercentiles
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
+  TABLESAMPLE SYSTEM (0.2 PERCENT)                 -- one reference only
 ),
-base AS (
-  SELECT s.*,
-         TIMESTAMP_TRUNC(s.dateHour, HOUR)                 AS hour_ts,
-         DIV(EXTRACT(MINUTE FROM s.dateHour), 15)          AS bin_idx   -- 0‑3
-  FROM `${project}.${dataset}.tt_bulk_test_geohash6` AS s
-  JOIN sample_keys           USING(geohash, dsegId)
-  WHERE TIMESTAMP_TRUNC(s.dateHour, HOUR) = sample_keys.hour_ts
+by_hour AS (
+  SELECT
+    geohash,
+    dsegId,
+    dateHour,
+
+    [STRUCT(MAX(IF(bin_idx = 0, sampleSize, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 1, sampleSize, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 2, sampleSize, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 3, sampleSize, NULL)) AS val)]            AS sampleSize_15m,
+
+    [STRUCT(MAX(IF(bin_idx = 0, averageSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 1, averageSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 2, averageSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 3, averageSpeedMetersPerHour, NULL)) AS val)] AS avgSpeed_15m,
+
+    [STRUCT(MAX(IF(bin_idx = 0, harmonicAverageSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 1, harmonicAverageSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 2, harmonicAverageSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 3, harmonicAverageSpeedMetersPerHour, NULL)) AS val)] AS harmSpeed_15m,
+
+    [STRUCT(MAX(IF(bin_idx = 0, medianSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 1, medianSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 2, medianSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 3, medianSpeedMetersPerHour, NULL)) AS val)]             AS medianSpeed_15m,
+
+    [STRUCT(MAX(IF(bin_idx = 0, standardDeviationSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 1, standardDeviationSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 2, standardDeviationSpeedMetersPerHour, NULL)) AS val),
+     STRUCT(MAX(IF(bin_idx = 3, standardDeviationSpeedMetersPerHour, NULL)) AS val)]  AS stdSpeed_15m,
+
+    [STRUCT(ANY_VALUE(IF(bin_idx = 0, speedPercentiles, NULL)) AS percentiles),
+     STRUCT(ANY_VALUE(IF(bin_idx = 1, speedPercentiles, NULL)) AS percentiles),
+     STRUCT(ANY_VALUE(IF(bin_idx = 2, speedPercentiles, NULL)) AS percentiles),
+     STRUCT(ANY_VALUE(IF(bin_idx = 3, speedPercentiles, NULL)) AS percentiles)]       AS speedPercentiles_15m,
+
+    SUM(sampleSize) AS total_sampleSize
+  FROM sample_rows
+  GROUP BY geohash, dsegId, dateHour
 )
-SELECT
-  geohash,
-  dsegId,
-  hour_ts AS dateHour,
-
-  -- Four‑slot arrays (struct‑wrapped to allow NULL scalar)
-  [STRUCT(MAX(IF(bin_idx = 0, sampleSize, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 1, sampleSize, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 2, sampleSize, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 3, sampleSize, NULL)) AS val)]          AS sampleSize_15m,
-
-  [STRUCT(MAX(IF(bin_idx = 0, averageSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 1, averageSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 2, averageSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 3, averageSpeedMetersPerHour, NULL)) AS val)] AS avgSpeed_15m,
-
-  [STRUCT(MAX(IF(bin_idx = 0, harmonicAverageSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 1, harmonicAverageSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 2, harmonicAverageSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 3, harmonicAverageSpeedMetersPerHour, NULL)) AS val)] AS harmSpeed_15m,
-
-  [STRUCT(MAX(IF(bin_idx = 0, medianSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 1, medianSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 2, medianSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 3, medianSpeedMetersPerHour, NULL)) AS val)]  AS medianSpeed_15m,
-
-  [STRUCT(MAX(IF(bin_idx = 0, standardDeviationSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 1, standardDeviationSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 2, standardDeviationSpeedMetersPerHour, NULL)) AS val),
-   STRUCT(MAX(IF(bin_idx = 3, standardDeviationSpeedMetersPerHour, NULL)) AS val)] AS stdSpeed_15m,
-
-  -- Percentiles already array ➜ need ANY_VALUE wrapper
-  [STRUCT(ANY_VALUE(IF(bin_idx = 0, speedPercentiles, NULL)) AS percentiles),
-   STRUCT(ANY_VALUE(IF(bin_idx = 1, speedPercentiles, NULL)) AS percentiles),
-   STRUCT(ANY_VALUE(IF(bin_idx = 2, speedPercentiles, NULL)) AS percentiles),
-   STRUCT(ANY_VALUE(IF(bin_idx = 3, speedPercentiles, NULL)) AS percentiles)]     AS speedPercentiles_15m,
-
-  SUM(sampleSize) AS total_sampleSize
-FROM base
-GROUP BY geohash, dsegId, dateHour;
+SELECT * FROM by_hour;
 
 -- ------------------------------------------------------------
--- At this point the wide table should have ≤ 400 rows.
--- Run the QA queries to confirm, then scale up by removing
--- the sample_keys CTE and TABLESAMPLE clause.
+-- Result: a few hundred rows written, tiny cost.  Rerun QA.
+-- To scale up, swap TABLESAMPLE for a RAND() filter or simply
+-- remove the sample_rows CTE and point at the full table.
 -- ------------------------------------------------------------
