@@ -3,8 +3,8 @@ WITH base AS (
   SELECT
     geohash,
     dsegId,
-    TIMESTAMP_TRUNC(dateHour , HOUR)                         AS hour_ts,
-    DIV(EXTRACT(MINUTE FROM dateHour), 15)                   AS bin_idx,   -- 0‑3
+    TIMESTAMP_TRUNC(dateHour , HOUR)                   AS hour_ts,
+    DIV(EXTRACT(MINUTE FROM dateHour), 15)             AS bin_idx,   -- 0‑3
     sampleSize,
     averageSpeedMetersPerHour           AS avg_spd,
     harmonicAverageSpeedMetersPerHour   AS harm_spd,
@@ -12,54 +12,45 @@ WITH base AS (
     standardDeviationSpeedMetersPerHour AS std_spd,
     speedPercentiles
   FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-),
-
-by_hour AS (
-  SELECT
-    geohash,
-    dsegId,
-    hour_ts                                         AS dateHour,
-
-    -- 4‑slot arrays; NULL‑pad missing bins
-    ARRAY(SELECT MAX(IF(bin_idx = i, sampleSize, NULL))
-          FROM UNNEST(GENERATE_ARRAY(0,3)) AS i)    AS sampleSize_15m,
-
-    ARRAY(SELECT MAX(IF(bin_idx = i, avg_spd, NULL))
-          FROM UNNEST(GENERATE_ARRAY(0,3)) AS i)    AS avgSpeed_15m,
-
-    ARRAY(SELECT MAX(IF(bin_idx = i, harm_spd, NULL))
-          FROM UNNEST(GENERATE_ARRAY(0,3)) AS i)    AS harmSpeed_15m,
-
-    ARRAY(SELECT MAX(IF(bin_idx = i, med_spd, NULL))
-          FROM UNNEST(GENERATE_ARRAY(0,3)) AS i)    AS medianSpeed_15m,
-
-    ARRAY(SELECT MAX(IF(bin_idx = i, std_spd, NULL))
-          FROM UNNEST(GENERATE_ARRAY(0,3)) AS i)    AS stdSpeed_15m,
-
-    -- struct‑wrapped inner array to satisfy BQ schema rules
-    ARRAY(
-      SELECT AS STRUCT MAX(IF(bin_idx = i, speedPercentiles, NULL)) AS percentiles
-      FROM UNNEST(GENERATE_ARRAY(0,3)) AS i
-    )                                              AS speedPercentiles_15m,
-
-    SUM(sampleSize)                                AS total_sampleSize
-  FROM base
-  GROUP BY geohash, dsegId, dateHour
 )
 
-SELECT * FROM by_hour;
+SELECT
+  geohash,
+  dsegId,
+  hour_ts                                         AS dateHour,
 
+  /* ───────────── 4‑slot arrays, built inline ───────────── */
+  [ MAX(IF(bin_idx = 0, sampleSize, NULL)),
+    MAX(IF(bin_idx = 1, sampleSize, NULL)),
+    MAX(IF(bin_idx = 2, sampleSize, NULL)),
+    MAX(IF(bin_idx = 3, sampleSize, NULL)) ]            AS sampleSize_15m,
 
+  [ MAX(IF(bin_idx = 0, avg_spd, NULL)),
+    MAX(IF(bin_idx = 1, avg_spd, NULL)),
+    MAX(IF(bin_idx = 2, avg_spd, NULL)),
+    MAX(IF(bin_idx = 3, avg_spd, NULL)) ]               AS avgSpeed_15m,
 
-======
+  [ MAX(IF(bin_idx = 0, harm_spd, NULL)),
+    MAX(IF(bin_idx = 1, harm_spd, NULL)),
+    MAX(IF(bin_idx = 2, harm_spd, NULL)),
+    MAX(IF(bin_idx = 3, harm_spd, NULL)) ]              AS harmSpeed_15m,
 
-| No.   | Check                                               | Query                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Expected result                                                                                        |
-| ----- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| **1** | **Row‑count parity** (long vs. wide)                | ``sql SELECT COUNT(*) AS cnt_wide FROM `…_wide`;  -- A  SELECT COUNT(DISTINCT geohash,dsegId,TIMESTAMP_TRUNC(dateHour,HOUR)) AS cnt_long FROM `…_geohash6`; -- B``                                                                                                                                                                                                                                                                                                                                                                                                        | `cnt_wide = cnt_long`                                                                                  |
-| **2** | **Array length = 4** for every row                  | ``sql SELECT COUNTIF(ARRAY_LENGTH(sampleSize_15m) != 4) AS bad_rows FROM `…_wide`;``                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `bad_rows` = 0                                                                                         |
-| **3** | **Total sample‑size integrity**                     | ``sql SELECT  SAFE_DIVIDE( (SELECT SUM(sampleSize) FROM `…_geohash6`),                           (SELECT SUM(total_sampleSize) FROM `…_wide`) ) AS ratio;``                                                                                                                                                                                                                                                                                                                                                                                                               | `ratio` = 1                                                                                            |
-| **4** | **Null padding logic**<br>(any hours with <4 bins?) | ``sql SELECT COUNT(*) AS partial_hours FROM `…_wide` WHERE ARRAY_LENGTH( (SELECT ARRAY(SELECT x FROM UNNEST(sampleSize_15m) x WHERE x IS NULL)) ) BETWEEN 1 AND 3;``                                                                                                                                                                                                                                                                                                                                                                                                      | Expect **> 0** rows (unless data is perfectly complete). You’re confirming the code **allowed NULLs**. |
-| **5** | **Sample row deep‑dive** (quick manual eyeball)     | ``sql SELECT * FROM `…_wide` ORDER BY RAND() LIMIT 5;``                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Visually confirm arrays look sane.                                                                     |
-| **6** | **Weighted mean speed parity**                      | ``sql WITH src AS ( SELECT geohash,dsegId, TIMESTAMP_TRUNC(dateHour,HOUR) h,  SUM(sampleSize*averageSpeedMetersPerHour) num,  SUM(sampleSize) den FROM `…_geohash6` GROUP BY 1,2,3 ), tgt AS ( SELECT geohash,dsegId,dateHour h,  (SELECT SUM(s*a) FROM UNNEST(sampleSize_15m) s WITH OFFSET o JOIN UNNEST(avgSpeed_15m) a WITH OFFSET o USING(offset)) AS num,  total_sampleSize                                   AS den FROM `…_wide` ) SELECT COUNT(*) AS mismatches FROM src JOIN tgt USING(geohash,dsegId,h) WHERE ABS(src.num/src.den - tgt.num/tgt.den) > 0.01;`` | `mismatches` = 0                                                                                       |
-| **7** | **Partition sanity** (no stray months)              | ``sql SELECT DISTINCT FORMAT_DATE('%Y‑%m', DATE_TRUNC(dateHour, MONTH)) AS part FROM `…_wide` ORDER BY part;``                                                                                                                                                                                                                                                                                                                                                                                                                                                            | List should match the months you loaded.                                                               |
-| **8** | **Percentile presence**                             | ``sql SELECT COUNTIF(percentiles IS NULL) AS null_pct_arrays FROM `…_wide`, UNNEST(speedPercentiles_15m) AS p;``                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Depends on data; you just confirm NULLs appear where expected (e.g., bins with no observations).       |
+  [ MAX(IF(bin_idx = 0, med_spd, NULL)),
+    MAX(IF(bin_idx = 1, med_spd, NULL)),
+    MAX(IF(bin_idx = 2, med_spd, NULL)),
+    MAX(IF(bin_idx = 3, med_spd, NULL)) ]               AS medianSpeed_15m,
+
+  [ MAX(IF(bin_idx = 0, std_spd, NULL)),
+    MAX(IF(bin_idx = 1, std_spd, NULL)),
+    MAX(IF(bin_idx = 2, std_spd, NULL)),
+    MAX(IF(bin_idx = 3, std_spd, NULL)) ]               AS stdSpeed_15m,
+
+  /* speedPercentiles needs ANY_VALUE because it’s already an ARRAY */
+  [ STRUCT(ANY_VALUE(IF(bin_idx = 0, speedPercentiles, NULL)) AS percentiles),
+    STRUCT(ANY_VALUE(IF(bin_idx = 1, speedPercentiles, NULL)) AS percentiles),
+    STRUCT(ANY_VALUE(IF(bin_idx = 2, speedPercentiles, NULL)) AS percentiles),
+    STRUCT(ANY_VALUE(IF(bin_idx = 3, speedPercentiles, NULL)) AS percentiles) ] AS speedPercentiles_15m,
+
+  SUM(sampleSize)                                       AS total_sampleSize
+FROM base
+GROUP BY geohash, dsegId, dateHour;
