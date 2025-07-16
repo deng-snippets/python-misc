@@ -1,0 +1,44 @@
+tt_segs AS (
+  SELECT
+    z.zone_id,
+    z.is_reversed,
+
+    -- slot‑specific UTC→local timestamp
+    TIMESTAMP(DATETIME(TIMESTAMP_ADD(a.dateHour, INTERVAL bin_idx*15 MINUTE), z.zone_tz))
+      AS local_time,
+
+    -- date‑range flags (unchanged logic, but use slot time)
+    CASE ... END AS from_date,
+    CASE ... END AS to_date,
+
+    UPPER(FORMAT_DATETIME('%a', DATE(local_time)))       AS dayofweek,
+    4 * EXTRACT(HOUR FROM local_time) + bin_idx          AS from_15m,
+
+    -- metrics pulled from arrays
+    z.tt_seg_weight * a.sampleSize_15m[OFFSET(bin_idx)].val             AS weighted_samplesize,
+    a.avgSpeed_15m[OFFSET(bin_idx)].val / 1609.34                       AS avg_speed_mph,
+    tomtom.arrayMetersToMiles(a.speedPercentiles_15m[OFFSET(bin_idx)]
+                                              .percentiles)            AS sp,
+
+    -- min / max helpers (same formulas, deeper path)
+    CASE WHEN ARRAY_LENGTH(a.speedPercentiles_15m[OFFSET(bin_idx)].percentiles)=0 THEN NULL
+         ELSE CAST(GREATEST(
+           0,
+           (a.speedPercentiles_15m[OFFSET(bin_idx)].percentiles[OFFSET(0)]
+            - 1.2*(a.speedPercentiles_15m[OFFSET(bin_idx)].percentiles[OFFSET(1)]
+                   - a.speedPercentiles_15m[OFFSET(bin_idx)].percentiles[OFFSET(0)]))
+         ) / 1609.34 AS INT64) END AS min_value,
+    CASE WHEN ARRAY_LENGTH(a.speedPercentiles_15m[OFFSET(bin_idx)].percentiles)=0 THEN NULL
+         ELSE CAST(
+           (a.speedPercentiles_15m[OFFSET(bin_idx)].percentiles[OFFSET(18)]
+            + 1.2*(a.speedPercentiles_15m[OFFSET(bin_idx)].percentiles[OFFSET(18)]
+                   - a.speedPercentiles_15m[OFFSET(bin_idx)].percentiles[OFFSET(17)]))
+         / 1609.34 AS INT64) END AS max_value
+  FROM  {geohash_table} AS a
+  CROSS JOIN UNNEST(GENERATE_ARRAY(0,3)) AS bin_idx         -- NEW
+  JOIN  mapped_zones z
+    ON  a.geohash = z.{geohash_column}
+   AND  a.dsegId = SAFE_CAST(z.tt_dsegid AS INT64)
+  WHERE TIMESTAMP_ADD(a.dateHour, INTERVAL bin_idx*15 MINUTE) >= @from_ts
+    AND TIMESTAMP_ADD(a.dateHour, INTERVAL bin_idx*15 MINUTE) < TIMESTAMP_ADD(@to_ts, INTERVAL 1 DAY)
+)
