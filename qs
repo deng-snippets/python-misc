@@ -1,83 +1,93 @@
--- row count parity
-SELECT COUNT(*) AS cnt_wide
-FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_wide`;
-
-WITH long AS (
-  SELECT DISTINCT geohash, dsegId, TIMESTAMP_TRUNC(dateHour, HOUR) AS h
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-)
-SELECT COUNT(*) AS cnt_long FROM long;
-
--- array length check (should always be 4)
-SELECT COUNTIF(
-  ARRAY_LENGTH(sampleSize_15m)         != 4 OR
-  ARRAY_LENGTH(avgSpeed_15m)           != 4 OR
-  ARRAY_LENGTH(harmSpeed_15m)          != 4 OR
-  ARRAY_LENGTH(medianSpeed_15m)        != 4 OR
-  ARRAY_LENGTH(stdSpeed_15m)           != 4 OR
-  ARRAY_LENGTH(speedPercentiles_15m)   != 4
-) AS bad_rows
-FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_wide`;
-
--- total sampleSize parity
-SELECT SAFE_DIVIDE(
-  (SELECT SUM(sampleSize) FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`),
-  (SELECT SUM(total_sampleSize) FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_wide`)
-) AS ratio;
-
--- check for null-padded bins
-SELECT COUNT(*) AS hours_with_nulls
-FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_wide`
-WHERE EXISTS (
-  SELECT 1
-  FROM UNNEST(sampleSize_15m) v
-  WHERE v IS NULL
-);
-
--- weighted mean speed parity
-WITH src AS (
-  SELECT
-    geohash, dsegId,
-    TIMESTAMP_TRUNC(dateHour, HOUR) AS h,
-    SUM(sampleSize * averageSpeedMetersPerHour) AS num,
-    SUM(sampleSize) AS den
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-  GROUP BY 1, 2, 3
+/*─────────────────────────────────────────────────────────────*
+ |  long_total_samples.sql                                     |
+ |  → total sample size from long table, for given zones       |
+ *─────────────────────────────────────────────────────────────*/
+WITH
+zones AS (
+  SELECT * FROM UNNEST(@zone_ids) AS zone_id
 ),
-tgt AS (
+data_range AS (                       -- keep the yyyymm linkage
+  SELECT * FROM UNNEST([@yyyymm]) AS yyyymm
+),
+inputs AS (
+  SELECT zone_id, yyyymm FROM zones, data_range
+),
+mapped_zones AS (
   SELECT
-    geohash, dsegId, dateHour AS h,
-    (SELECT SUM(s * a)
-     FROM UNNEST(sampleSize_15m) s WITH OFFSET o
-     JOIN UNNEST(avgSpeed_15m) a USING (offset)) AS num,
-    total_sampleSize AS den
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_wide`
+    i.zone_id,
+    l.basemap_yearmonth,
+    m.{geohash_column}   AS gh,
+    SAFE_CAST(m.tt_dsegid AS INT64) AS dseg_id
+  FROM inputs i
+  JOIN `stl-datascience.tomtom.dseg_basemap_lookup`     l
+    ON i.yyyymm = l.data_yearmonth
+  JOIN `stl-datascience.tomtom.dseg_osm_jan25_tt_map_v1` m
+    ON  m.yyyymm  = l.basemap_yearmonth
+   AND m.zone_id  = i.zone_id
+),
+src AS (           -- 15‑min rows filtered by zone + time
+  SELECT
+    z.zone_id,
+    a.sampleSize
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`  AS a
+  JOIN mapped_zones                                    AS z
+    ON a.geohash = z.gh
+   AND a.dsegId  = z.dseg_id
+  WHERE a.dateHour >= @from_ts
+    AND a.dateHour <  @to_ts
 )
-SELECT COUNT(*) AS mismatches_gt_1pct
+SELECT
+  zone_id,
+  SUM(sampleSize) AS total_samples
 FROM src
-JOIN tgt USING (geohash, dsegId, h)
-WHERE ABS(src.num / src.den - tgt.num / tgt.den) > 0.01;
+GROUP BY zone_id;
 
--- detect duplicates in original 15min bins
+
+--------
+
+
+/*─────────────────────────────────────────────────────────────*
+ |  wide_total_samples.sql                                    |
+ |  → same result using the new wide table                    |
+ *─────────────────────────────────────────────────────────────*/
+WITH
+zones AS (
+  SELECT * FROM UNNEST(@zone_ids) AS zone_id
+),
+data_range AS (
+  SELECT * FROM UNNEST([@yyyymm]) AS yyyymm
+),
+inputs AS (
+  SELECT zone_id, yyyymm FROM zones, data_range
+),
+mapped_zones AS (
+  SELECT
+    i.zone_id,
+    l.basemap_yearmonth,
+    m.{geohash_column}   AS gh,
+    SAFE_CAST(m.tt_dsegid AS INT64) AS dseg_id
+  FROM inputs i
+  JOIN `stl-datascience.tomtom.dseg_basemap_lookup`     l
+    ON i.yyyymm = l.data_yearmonth
+  JOIN `stl-datascience.tomtom.dseg_osm_jan25_tt_map_v1` m
+    ON  m.yyyymm  = l.basemap_yearmonth
+   AND m.zone_id  = i.zone_id
+),
+src AS (           -- explode 4×15‑min bins per hour
+  SELECT
+    z.zone_id,
+    s.val AS sampleSize,
+    TIMESTAMP_ADD(a.dateHour, INTERVAL OFFSET(s)*15 MINUTE) AS slot_ts
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_wide` AS a
+  JOIN mapped_zones                                        AS z
+    ON a.geohash = z.gh
+   AND a.dsegId  = z.dseg_id
+  CROSS JOIN UNNEST(a.sampleSize_15m) AS s               -- s is STRUCT<val INT64>
+  WHERE slot_ts >= @from_ts
+    AND slot_ts <  @to_ts
+)
 SELECT
-  geohash, dsegId,
-  TIMESTAMP_TRUNC(dateHour, HOUR) AS h,
-  DIV(EXTRACT(MINUTE FROM dateHour), 15) AS bin_idx,
-  COUNT(*) AS dup_cnt
-FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-GROUP BY 1, 2, 3, 4
-HAVING dup_cnt > 1
-ORDER BY dup_cnt DESC
-LIMIT 20;
-
--- check monthly partition coverage
-SELECT DISTINCT FORMAT_DATE('%Y-%m', DATE_TRUNC(dateHour, MONTH)) AS part
-FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_wide`
-ORDER BY part;
-
--- inspect null percentile arrays
-SELECT
-  COUNTIF(p.percentiles IS NULL) AS null_pct_structs,
-  COUNT(*) AS total_structs
-FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_wide`,
-UNNEST(speedPercentiles_15m) AS p;
+  zone_id,
+  SUM(sampleSize) AS total_samples
+FROM src
+GROUP BY zone_id;
