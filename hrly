@@ -1,0 +1,86 @@
+WITH
+-- 1.  Pick the first N physical rows to keep the scan tiny
+sample AS (
+  SELECT *
+  FROM   `stl-datascience.tomtom.tt_bulk_test_geohash6_wide_full`
+  ORDER  BY dateHour, geohash      -- deterministic slice
+  LIMIT  1000
+),
+
+-- 2.  For each sampled hour row, compute the aggregates in a sub-SELECT
+hour_aggs AS (
+  SELECT
+    w.*,
+
+    -- ───────── weighted means (metric × sampleSize / Σ sampleSize) ─────────
+    SAFE_DIVIDE(
+      (SELECT SUM(s.val * w.avgSpeed_15m[OFFSET(o)].val)
+         FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
+         WHERE s.val IS NOT NULL),
+      (SELECT SUM(s.val)
+         FROM UNNEST(w.sampleSize_15m) s
+         WHERE s.val IS NOT NULL)
+    ) AS avgSpeedMetersPerHour_hour,
+
+    SAFE_DIVIDE(
+      (SELECT SUM(s.val * w.harmSpeed_15m[OFFSET(o)].val)
+         FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
+         WHERE s.val IS NOT NULL),
+      (SELECT SUM(s.val)
+         FROM UNNEST(w.sampleSize_15m) s
+         WHERE s.val IS NOT NULL)
+    ) AS harmSpeedMetersPerHour_hour,
+
+    SAFE_DIVIDE(
+      (SELECT SUM(s.val * w.medianSpeed_15m[OFFSET(o)].val)
+         FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
+         WHERE s.val IS NOT NULL),
+      (SELECT SUM(s.val)
+         FROM UNNEST(w.sampleSize_15m) s
+         WHERE s.val IS NOT NULL)
+    ) AS medianSpeedMetersPerHour_hour,
+
+    SAFE_DIVIDE(
+      (SELECT SUM(s.val * w.stdSpeed_15m[OFFSET(o)].val)
+         FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
+         WHERE s.val IS NOT NULL),
+      (SELECT SUM(s.val)
+         FROM UNNEST(w.sampleSize_15m) s
+         WHERE s.val IS NOT NULL)
+    ) AS stdSpeedMetersPerHour_hour,
+
+    -- ───────── 19-percentile array via synthetic-sample TDigest ─────────
+    (
+      WITH
+        syn AS (
+          -- one row per (quarter-hour slice, percentile index)
+          SELECT
+            w.speedPercentiles_15m[OFFSET(o)]
+              .percentiles[OFFSET(idx)]        AS val,
+            SAFE_CAST(ROUND(s.val / 19) AS INT64) AS wt
+          FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
+          CROSS JOIN UNNEST(GENERATE_ARRAY(0, 18)) idx
+          WHERE s.val IS NOT NULL                    -- ignore empty slices
+            AND ARRAY_LENGTH(
+                  w.speedPercentiles_15m[OFFSET(o)].percentiles
+                ) = 19
+        )
+      SELECT APPROX_QUANTILES(val, wt, 19)
+      FROM   syn
+    ) AS speedPercentiles_hour
+
+  FROM sample AS w
+)
+
+SELECT
+  geohash,
+  dsegId,
+  dateHour,
+  avgSpeedMetersPerHour_hour,
+  harmSpeedMetersPerHour_hour,
+  medianSpeedMetersPerHour_hour,
+  stdSpeedMetersPerHour_hour,
+  speedPercentiles_hour
+FROM hour_aggs
+ORDER BY dateHour, geohash
+LIMIT 50;                -- show just a few rows in the console
