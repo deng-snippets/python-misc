@@ -1,74 +1,183 @@
--- ───────────────────────────────────────────────────────────────
--- Hour-level aggregates sandbox – first N rows only
--- ───────────────────────────────────────────────────────────────
-DECLARE row_limit INT64 DEFAULT 1000;   -- tweak as desired
+-- ─────────────────────────────────────────────────────────────
+--  STEP 1:  Build hour-level aggregates from 15-minute slices
+--           Uses TomTom midpoint + resample for percentiles
+--           Units: speeds stored in metres per hour *inside* the table;
+--                  percentile logic converts to mph for simulation, then
+--                  results are returned in mph (you can switch back if
+--                  needed).
+-- ─────────────────────────────────────────────────────────────
+CREATE OR REPLACE TABLE
+  `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
+PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
+CLUSTER BY geohash, dsegId, dateHour AS
+WITH source AS (
 
-WITH sample AS (
+  /* ----------------------------------------------------------
+     Uncomment the next line for a fast 0.1 % block sample
+     when testing.  Remove or comment-out for full run.
+  ---------------------------------------------------------- */
   SELECT *
-  FROM   `stl-datascience.tomtom.tt_bulk_test_geohash6_wide_full`
-  ORDER  BY dateHour, geohash         -- deterministic slice
-  LIMIT  row_limit
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
+  -- TABLESAMPLE SYSTEM (0.1 PERCENT)   -- ← enable for test only
+
+), valid_slices AS (
+  SELECT
+    dsegId,
+    geohash,
+    TIMESTAMP_TRUNC(dateHour, HOUR) AS hour_ts,
+    sampleSize,
+    averageSpeedMetersPerHour,
+    harmonicAverageSpeedMetersPerHour,
+    medianSpeedMetersPerHour,
+    standardDeviationSpeedMetersPerHour,
+
+    -- convert 19-bin array from m/h → mph for TomTom helpers
+    tomtom.arrayMetersToMiles(speedPercentiles)          AS sp_mph
+  FROM source
+  WHERE sampleSize IS NOT NULL
+    AND ARRAY_LENGTH(speedPercentiles) = 19              -- must have all bins
+),
+
+simulated AS (
+  SELECT
+    dsegId,
+    geohash,
+    hour_ts,
+    sampleSize,
+    averageSpeedMetersPerHour,
+    harmonicAverageSpeedMetersPerHour,
+    medianSpeedMetersPerHour,
+    standardDeviationSpeedMetersPerHour,
+
+    tomtom.resampleSpeedValues(
+      tomtom.midpointMethodInt(
+        sp_mph,
+        -- p5-extrapolated min (mph)
+        CAST(GREATEST(
+          0,
+          sp_mph[SAFE_OFFSET(0)]
+          - 1.2 * (sp_mph[SAFE_OFFSET(1)] - sp_mph[SAFE_OFFSET(0)])
+        ) AS INT64),
+        -- p95-extrapolated max (mph)
+        CAST(
+          sp_mph[SAFE_OFFSET(18)]
+          + 1.2 * (sp_mph[SAFE_OFFSET(18)] - sp_mph[SAFE_OFFSET(17)])
+          AS INT64)
+      ),
+      GREATEST(CAST(ROUND(sampleSize) AS INT64), 1)      -- weight
+    )                                                    AS synthetic_speeds
+  FROM valid_slices
+),
+
+agg AS (
+  SELECT
+    dsegId,
+    geohash,
+    hour_ts                                   AS dateHour,
+
+    SUM(sampleSize)                           AS total_sampleSize,
+
+    SAFE_DIVIDE(SUM(sampleSize * averageSpeedMetersPerHour),
+                SUM(sampleSize))              AS avgSpeedMetersPerHour,
+    SAFE_DIVIDE(SUM(sampleSize * harmonicAverageSpeedMetersPerHour),
+                SUM(sampleSize))              AS harmSpeedMetersPerHour,
+    SAFE_DIVIDE(SUM(sampleSize * medianSpeedMetersPerHour),
+                SUM(sampleSize))              AS medianSpeedMetersPerHour,
+    SAFE_DIVIDE(SUM(sampleSize * standardDeviationSpeedMetersPerHour),
+                SUM(sampleSize))              AS stdSpeedMetersPerHour,
+
+    ARRAY_CONCAT_AGG(synthetic_speeds)        AS all_speeds_mph
+  FROM simulated
+  GROUP BY dsegId, geohash, hour_ts
 )
 
 SELECT
-  w.geohash,
-  w.dsegId,
-  w.dateHour,
+  dsegId,
+  geohash,
+  dateHour,
+  total_sampleSize,
+  avgSpeedMetersPerHour,
+  harmSpeedMetersPerHour,
+  medianSpeedMetersPerHour,
+  stdSpeedMetersPerHour,
 
-  -- ───── weighted means ─────
-  SAFE_DIVIDE(
-    (SELECT SUM(s.val * w.avgSpeed_15m[OFFSET(o)].val)
-       FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
-       WHERE s.val IS NOT NULL),
-    (SELECT SUM(s.val)
-       FROM UNNEST(w.sampleSize_15m) s
-       WHERE s.val IS NOT NULL)
-  ) AS avgSpeedMetersPerHour_hour,
+  -- 19-bin hour-level percentiles (mph)
+  APPROX_QUANTILES(speed_val, 19)             AS speedPercentiles_mph
+FROM agg,
+     UNNEST(all_speeds_mph) AS speed_val;
 
-  SAFE_DIVIDE(
-    (SELECT SUM(s.val * w.harmSpeed_15m[OFFSET(o)].val)
-       FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
-       WHERE s.val IS NOT NULL),
-    (SELECT SUM(s.val)
-       FROM UNNEST(w.sampleSize_15m) s
-       WHERE s.val IS NOT NULL)
-  ) AS harmSpeedMetersPerHour_hour,
+=========
 
-  SAFE_DIVIDE(
-    (SELECT SUM(s.val * w.medianSpeed_15m[OFFSET(o)].val)
-       FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
-       WHERE s.val IS NOT NULL),
-    (SELECT SUM(s.val)
-       FROM UNNEST(w.sampleSize_15m) s
-       WHERE s.val IS NOT NULL)
-  ) AS medianSpeedMetersPerHour_hour,
+2.1 Compare total sample size
 
-  SAFE_DIVIDE(
-    (SELECT SUM(s.val * w.stdSpeed_15m[OFFSET(o)].val)
-       FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
-       WHERE s.val IS NOT NULL),
-    (SELECT SUM(s.val)
-       FROM UNNEST(w.sampleSize_15m) s
-       WHERE s.val IS NOT NULL)
-  ) AS stdSpeedMetersPerHour_hour,
+-- Expect zero rows ⇒ counts match
+WITH slices AS (
+  SELECT dsegId, geohash,
+         TIMESTAMP_TRUNC(dateHour, HOUR) AS hr,
+         SUM(sampleSize) AS sum_samples
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
+  TABLESAMPLE SYSTEM (0.1 PERCENT)
+  GROUP BY dsegId, geohash, hr
+),
+hourly AS (
+  SELECT dsegId, geohash, dateHour AS hr, total_sampleSize
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
+)
+SELECT *
+FROM hourly
+JOIN slices USING (dsegId, geohash, hr)
+WHERE total_sampleSize <> sum_samples
+LIMIT 10;
 
-  -- ───── 19-percentile array via synthetic-sample TDigest ─────
-  (
-    SELECT APPROX_QUANTILES(val , wt , 19)
-    FROM (
-      SELECT
-        w.speedPercentiles_15m[OFFSET(o)]
-          .percentiles[OFFSET(idx)]               AS val,
-        SAFE_CAST(ROUND(s.val / 19) AS INT64)     AS wt
-      FROM UNNEST(w.sampleSize_15m) s WITH OFFSET o
-      CROSS JOIN UNNEST(GENERATE_ARRAY(0,18)) idx
-      WHERE s.val IS NOT NULL
-        AND ARRAY_LENGTH(
-              w.speedPercentiles_15m[OFFSET(o)].percentiles
-            ) = 19
-    )
-  ) AS speedPercentiles_hour
 
-FROM sample AS w
-ORDER BY w.dateHour, w.geohash
-LIMIT 50;            -- just show a few rows
+============
+
+2.2 Compare weighted average speed (m/h)
+
+-- Should return zero rows (or tiny float wiggle room)
+WITH slices AS (
+  SELECT dsegId, geohash,
+         TIMESTAMP_TRUNC(dateHour, HOUR) AS hr,
+         SAFE_DIVIDE(SUM(sampleSize * averageSpeedMetersPerHour),
+                     SUM(sampleSize))    AS avg_speed_direct
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
+  TABLESAMPLE SYSTEM (0.1 PERCENT)
+  GROUP BY dsegId, geohash, hr
+),
+hourly AS (
+  SELECT dsegId, geohash, dateHour AS hr, avgSpeedMetersPerHour
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
+)
+SELECT *
+FROM hourly
+JOIN slices USING (dsegId, geohash, hr)
+WHERE ABS(avgSpeedMetersPerHour - avg_speed_direct) > 1e-6   -- tolerance
+LIMIT 10;
+
+==============
+
+2.3 Spot-check median (p50) percentiles
+
+WITH direct_p50 AS (
+  SELECT dsegId, geohash,
+         TIMESTAMP_TRUNC(dateHour, HOUR) AS hr,
+         APPROX_QUANTILES(
+           tomtom.arrayMetersToMiles(speedPercentiles), 19
+         )[SAFE_OFFSET(9)]              AS p50_direct
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
+  TABLESAMPLE SYSTEM (0.1 PERCENT)
+  WHERE sampleSize IS NOT NULL
+    AND ARRAY_LENGTH(speedPercentiles)=19
+  GROUP BY dsegId, geohash, hr
+),
+hourly AS (
+  SELECT dsegId, geohash, dateHour AS hr,
+         speedPercentiles_mph[SAFE_OFFSET(9)] AS p50_hour
+  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
+)
+SELECT *
+FROM hourly
+JOIN direct_p50 USING (dsegId, geohash, hr)
+-- show rows where the two p50s differ by > 1 mph
+WHERE ABS(p50_hour - p50_direct) > 1
+LIMIT 10;
