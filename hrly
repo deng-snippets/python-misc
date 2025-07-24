@@ -1,26 +1,19 @@
 -- ─────────────────────────────────────────────────────────────
 --  STEP 1:  Build hour-level aggregates from 15-minute slices
 --           Uses TomTom midpoint + resample for percentiles
---           Units: speeds stored in metres per hour *inside* the table;
---                  percentile logic converts to mph for simulation, then
---                  results are returned in mph (you can switch back if
---                  needed).
+--           (optionally TABLESAMPLE for cheap tests)
 -- ─────────────────────────────────────────────────────────────
 CREATE OR REPLACE TABLE
   `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
 PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
 CLUSTER BY geohash, dsegId, dateHour AS
 WITH source AS (
-
-  /* ----------------------------------------------------------
-     Uncomment the next line for a fast 0.1 % block sample
-     when testing.  Remove or comment-out for full run.
-  ---------------------------------------------------------- */
   SELECT *
   FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
   -- TABLESAMPLE SYSTEM (0.1 PERCENT)   -- ← enable for test only
+),
 
-), valid_slices AS (
+valid_slices AS (
   SELECT
     dsegId,
     geohash,
@@ -30,12 +23,10 @@ WITH source AS (
     harmonicAverageSpeedMetersPerHour,
     medianSpeedMetersPerHour,
     standardDeviationSpeedMetersPerHour,
-
-    -- convert 19-bin array from m/h → mph for TomTom helpers
     tomtom.arrayMetersToMiles(speedPercentiles)          AS sp_mph
   FROM source
   WHERE sampleSize IS NOT NULL
-    AND ARRAY_LENGTH(speedPercentiles) = 19              -- must have all bins
+    AND ARRAY_LENGTH(speedPercentiles) = 19
 ),
 
 simulated AS (
@@ -52,20 +43,20 @@ simulated AS (
     tomtom.resampleSpeedValues(
       tomtom.midpointMethodInt(
         sp_mph,
-        -- p5-extrapolated min (mph)
+        /* min mph (extrapolated p5) */
         CAST(GREATEST(
           0,
           sp_mph[SAFE_OFFSET(0)]
           - 1.2 * (sp_mph[SAFE_OFFSET(1)] - sp_mph[SAFE_OFFSET(0)])
         ) AS INT64),
-        -- p95-extrapolated max (mph)
+        /* max mph (extrapolated p95) */
         CAST(
           sp_mph[SAFE_OFFSET(18)]
           + 1.2 * (sp_mph[SAFE_OFFSET(18)] - sp_mph[SAFE_OFFSET(17)])
           AS INT64)
       ),
-      GREATEST(CAST(ROUND(sampleSize) AS INT64), 1)      -- weight
-    )                                                    AS synthetic_speeds
+      GREATEST(CAST(ROUND(sampleSize) AS INT64), 1)
+    ) AS synthetic_speeds
   FROM valid_slices
 ),
 
@@ -100,11 +91,19 @@ SELECT
   harmSpeedMetersPerHour,
   medianSpeedMetersPerHour,
   stdSpeedMetersPerHour,
+  APPROX_QUANTILES(speed_val, 19) AS speedPercentiles_mph
+FROM agg
+CROSS JOIN UNNEST(all_speeds_mph) AS speed_val
+GROUP BY
+  dsegId,
+  geohash,
+  dateHour,
+  total_sampleSize,
+  avgSpeedMetersPerHour,
+  harmSpeedMetersPerHour,
+  medianSpeedMetersPerHour,
+  stdSpeedMetersPerHour;
 
-  -- 19-bin hour-level percentiles (mph)
-  APPROX_QUANTILES(speed_val, 19)             AS speedPercentiles_mph
-FROM agg,
-     UNNEST(all_speeds_mph) AS speed_val;
 
 =========
 
