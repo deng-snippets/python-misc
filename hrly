@@ -1,83 +1,80 @@
 -- ─────────────────────────────────────────────────────────────
---  STEP 1:  Build hour-level aggregates from 15-minute slices
---           Uses TomTom midpoint + resample for percentiles
---           (optionally TABLESAMPLE for cheap tests)
+-- Build hour-level table from 15-minute slices
+--   • TomTom midpoint + resample for percentiles
+--   • Handles slices whose speedPercentiles = [] (sampleSize = 1)
+--   • Keeps hour row even when all four slices are empty
 -- ─────────────────────────────────────────────────────────────
 CREATE OR REPLACE TABLE
   `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
 PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
 CLUSTER BY geohash, dsegId, dateHour AS
+
 WITH source AS (
+  -- ==========================================================
+  -- Toggle the next line for a cheap repeatable 0.1 % test run
+  -- ==========================================================
   SELECT *
   FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-  -- TABLESAMPLE SYSTEM (0.1 PERCENT)   -- ← enable for test only
-),
-
-valid_slices AS (
-  SELECT
-    dsegId,
-    geohash,
-    TIMESTAMP_TRUNC(dateHour, HOUR) AS hour_ts,
-    sampleSize,
-    averageSpeedMetersPerHour,
-    harmonicAverageSpeedMetersPerHour,
-    medianSpeedMetersPerHour,
-    standardDeviationSpeedMetersPerHour,
-    tomtom.arrayMetersToMiles(speedPercentiles)          AS sp_mph
-  FROM source
-  WHERE sampleSize IS NOT NULL
-    AND ARRAY_LENGTH(speedPercentiles) = 19
+  -- TABLESAMPLE SYSTEM (0.1 PERCENT) REPEATABLE (42)  -- ← enable for QA
 ),
 
 simulated AS (
   SELECT
     dsegId,
     geohash,
-    hour_ts,
+    TIMESTAMP_TRUNC(dateHour, HOUR)           AS hour_ts,
     sampleSize,
     averageSpeedMetersPerHour,
     harmonicAverageSpeedMetersPerHour,
     medianSpeedMetersPerHour,
     standardDeviationSpeedMetersPerHour,
 
-    tomtom.resampleSpeedValues(
-      tomtom.midpointMethodInt(
-        sp_mph,
-        /* min mph (extrapolated p5) */
-        CAST(GREATEST(
-          0,
-          sp_mph[SAFE_OFFSET(0)]
-          - 1.2 * (sp_mph[SAFE_OFFSET(1)] - sp_mph[SAFE_OFFSET(0)])
-        ) AS INT64),
-        /* max mph (extrapolated p95) */
-        CAST(
-          sp_mph[SAFE_OFFSET(18)]
-          + 1.2 * (sp_mph[SAFE_OFFSET(18)] - sp_mph[SAFE_OFFSET(17)])
-          AS INT64)
+    -- ---------- synthetic sample array (may be empty) ----------
+    IF(
+      ARRAY_LENGTH(speedPercentiles) = 19,
+      tomtom.resampleSpeedValues(
+        tomtom.midpointMethodInt(
+          tomtom.arrayMetersToMiles(speedPercentiles),
+          CAST(GREATEST(
+            0,
+            tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(0)]
+            - 1.2 * (
+              tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(1)]
+              - tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(0)]
+            )
+          ) AS INT64),
+          CAST(
+            tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(18)]
+            + 1.2 * (
+              tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(18)]
+              - tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(17)]
+            ) AS INT64)
+        ),
+        GREATEST(CAST(ROUND(sampleSize) AS INT64), 1)
       ),
-      GREATEST(CAST(ROUND(sampleSize) AS INT64), 1)
+      []           -- ← empty array when slice has no percentiles
     ) AS synthetic_speeds
-  FROM valid_slices
+  FROM source
 ),
 
 agg AS (
   SELECT
     dsegId,
     geohash,
-    hour_ts                                   AS dateHour,
+    hour_ts                                AS dateHour,
 
-    SUM(sampleSize)                           AS total_sampleSize,
+    SUM(sampleSize)                        AS total_sampleSize,
 
     SAFE_DIVIDE(SUM(sampleSize * averageSpeedMetersPerHour),
-                SUM(sampleSize))              AS avgSpeedMetersPerHour,
+                SUM(sampleSize))           AS avgSpeedMetersPerHour,
     SAFE_DIVIDE(SUM(sampleSize * harmonicAverageSpeedMetersPerHour),
-                SUM(sampleSize))              AS harmSpeedMetersPerHour,
+                SUM(sampleSize))           AS harmSpeedMetersPerHour,
     SAFE_DIVIDE(SUM(sampleSize * medianSpeedMetersPerHour),
-                SUM(sampleSize))              AS medianSpeedMetersPerHour,
+                SUM(sampleSize))           AS medianSpeedMetersPerHour,
     SAFE_DIVIDE(SUM(sampleSize * standardDeviationSpeedMetersPerHour),
-                SUM(sampleSize))              AS stdSpeedMetersPerHour,
+                SUM(sampleSize))           AS stdSpeedMetersPerHour,
 
-    ARRAY_CONCAT_AGG(synthetic_speeds)        AS all_speeds_mph
+    ARRAY_CONCAT_AGG(synthetic_speeds)     AS all_speeds_mph     -- may be []
   FROM simulated
   GROUP BY dsegId, geohash, hour_ts
 )
@@ -91,18 +88,17 @@ SELECT
   harmSpeedMetersPerHour,
   medianSpeedMetersPerHour,
   stdSpeedMetersPerHour,
-  APPROX_QUANTILES(speed_val, 19) AS speedPercentiles_mph
-FROM agg
-CROSS JOIN UNNEST(all_speeds_mph) AS speed_val
-GROUP BY
-  dsegId,
-  geohash,
-  dateHour,
-  total_sampleSize,
-  avgSpeedMetersPerHour,
-  harmSpeedMetersPerHour,
-  medianSpeedMetersPerHour,
-  stdSpeedMetersPerHour;
+
+  -- ---------- hour-level 19-bin percentile array ----------
+  (
+    CASE
+      WHEN ARRAY_LENGTH(all_speeds_mph) = 0 THEN []            -- no valid slices
+      ELSE (SELECT APPROX_QUANTILES(val, 19)
+            FROM UNNEST(all_speeds_mph) AS val)
+    END
+  ) AS speedPercentiles_mph
+FROM agg;
+
 
 
 =========
