@@ -1,111 +1,20 @@
+/* ─── inside the final SELECT ─── */
+CASE
+  WHEN ARRAY_LENGTH(all_sims_mph) = 0 THEN []
 
-CREATE OR REPLACE TABLE
-  `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
-PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
-CLUSTER BY geohash, dsegId, dateHour AS
-
-WITH slices AS (
-  SELECT
-    dsegId,
-    geohash,
-    TIMESTAMP_TRUNC(dateHour, HOUR)                         AS hour_ts,
-    sampleSize                                              AS n,
-    averageSpeedMetersPerHour                               AS v_arith,
-    harmonicAverageSpeedMetersPerHour                       AS v_harm,
-    tomtom.arrayMetersToMiles(speedPercentiles)             AS sp_mph 
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-),
-
-simulated AS (
-  SELECT
-    dsegId,
-    geohash,
-    hour_ts,
-    n,
-    v_arith,
-    v_harm,
-
-    IF(
-       ARRAY_LENGTH(sp_mph) = 19,
-       tomtom.resampleSpeedValues(
-         tomtom.midpointMethodInt(
-           sp_mph,
-           CAST(GREATEST(0,
-             sp_mph[OFFSET(0)] -
-             1.2 * (sp_mph[OFFSET(1)] - sp_mph[OFFSET(0)])) AS INT64),
-           CAST(
-             sp_mph[OFFSET(18)] +
-             1.2 * (sp_mph[OFFSET(18)] - sp_mph[OFFSET(17)])
-           AS INT64)
-         ),
-         GREATEST(CAST(ROUND(n) AS INT64), 1)
-       ),
-       []
-    ) AS sims_mph
-  FROM slices
-),
-
-agg AS (
-  SELECT
-    dsegId,
-    geohash,
-    hour_ts                                            AS dateHour,
-
-    /* counts & means */
-    SUM(n)                                             AS total_sampleSize,
-    SAFE_DIVIDE(SUM(n * v_arith), SUM(n))              AS avgSpeedMetersPerHour,
-    SAFE_DIVIDE(SUM(n), SUM(n / NULLIF(v_harm,0)))     AS harmSpeedMetersPerHour,
-
-    /* all synthetic probes, concatenated */
-    ARRAY_CONCAT_AGG(sims_mph)                         AS all_sims_mph
-  FROM simulated
-  GROUP BY dsegId, geohash, hour_ts
-),
-
-hist AS (
-  SELECT
-    *,
-    /* ---- 130-slot histogram of probe counts ---- */
-    tomtom.speedVals2Counts(all_sims_mph)              AS speed_hist_mph
-  FROM agg
-)
-
-SELECT
-  dsegId,
-  geohash,
-  dateHour,
-  total_sampleSize,
-  avgSpeedMetersPerHour,
-  harmSpeedMetersPerHour,
-
-  /* ---- 19-bin percentiles, metres/hour ----
-     • build only when we have ≥ 20 probe counts (legacy rule)
-     • otherwise return []                                      */
-  CASE
-    WHEN total_sampleSize < 20
-      OR ARRAY_LENGTH(speed_hist_mph) = 0 THEN []
-
-    ELSE (
-      /* ➊ histogram → 19-bin percentiles (mph, ints) */
-      SELECT
-        stl-datascience.ma_tt.floatToint(
-          stl-datascience.ma_tt.histToPercentiles_js(speed_hist_mph)
-        )
-    ) END                                            AS speedPercentiles_mph_int,
-    
-  /* ➋ convert those mph ints into metres / hour ints */
-  CASE
-    WHEN total_sampleSize < 20
-      OR ARRAY_LENGTH(speed_hist_mph) = 0 THEN []
-
-    ELSE (
-      SELECT ARRAY(
-        SELECT CAST(ROUND(p * 1609.34) AS INT64)
-        FROM UNNEST(
-          stl-datascience.ma_tt.floatToint(
-            stl-datascience.ma_tt.histToPercentiles_js(speed_hist_mph)
-          )
-        ) AS p
-      )
-    ) END AS speedPercentiles
-FROM hist;
+  ELSE (
+    -- 1️⃣ histogram (INT64) ➜ cast to FLOAT64 for UDF
+    WITH float_hist AS (
+      SELECT ARRAY(SELECT CAST(val AS FLOAT64) FROM UNNEST(speed_hist_mph) AS val) AS hist_f64
+    )
+    SELECT ARRAY(
+             -- 2️⃣ percentile array from UDF (FLOAT64) ➜ round & cast to INT64
+             SELECT CAST(ROUND(p * 1609.34) AS INT64)          -- mph → m/h
+             FROM UNNEST(
+                    `stl-datascience.ma_tt.histToPercentiles_js`(
+                      (SELECT hist_f64 FROM float_hist)        -- ARRAY<FLOAT64>
+                    )
+                  ) AS p
+           )
+  )
+END AS speedPercentiles
