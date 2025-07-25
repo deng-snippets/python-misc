@@ -1,8 +1,6 @@
 -- ─────────────────────────────────────────────────────────────
--- Hour-level aggregation from 15-min table (geo6)
---  • TomTom histogram pipeline, NO APPROX_QUANTILES
---  • Units: metres/hour everywhere
---  • Keeps hour row even if all four slices lack percentiles
+-- Hour-level aggregation – TomTom histogram pipeline
+-- Units: metres/hour — NO APPROX_QUANTILES
 -- ─────────────────────────────────────────────────────────────
 CREATE OR REPLACE TABLE
   `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
@@ -13,11 +11,11 @@ WITH slices AS (
   SELECT
     dsegId,
     geohash,
-    TIMESTAMP_TRUNC(dateHour, HOUR)                         AS hour_ts,
-    sampleSize                                              AS n,
-    averageSpeedMetersPerHour                               AS v_arith,
-    harmonicAverageSpeedMetersPerHour                       AS v_harm,
-    tomtom.arrayMetersToMiles(speedPercentiles)             AS sp_mph
+    TIMESTAMP_TRUNC(dateHour, HOUR)                        AS hour_ts,
+    sampleSize                                             AS n,
+    averageSpeedMetersPerHour                              AS v_arith,
+    harmonicAverageSpeedMetersPerHour                      AS v_harm,
+    tomtom.arrayMetersToMiles(speedPercentiles)            AS sp_mph
   FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
 ),
 
@@ -56,7 +54,6 @@ agg AS (
     dsegId,
     geohash,
     hour_ts                                           AS dateHour,
-
     SUM(n)                                            AS total_sampleSize,
     SAFE_DIVIDE(SUM(n * v_arith), SUM(n))             AS avgSpeedMetersPerHour,
     SAFE_DIVIDE(SUM(n), SUM(n / NULLIF(v_harm,0)))    AS harmSpeedMetersPerHour,
@@ -80,26 +77,19 @@ SELECT
   avgSpeedMetersPerHour,
   harmSpeedMetersPerHour,
 
-  /* ---- build 19-bin percentile array in metres/hour ---- */
+  /* 19-bin percentiles in metres/hour ([], if all slices empty) */
   CASE
-    WHEN ARRAY_LENGTH(speed_hist_int) = 0 THEN []   -- all four slices empty
+    WHEN ARRAY_LENGTH(speed_hist_int) = 0 THEN []
     ELSE (
-      -- 1️⃣ cast histogram INT64 → FLOAT64 for JS UDF
-      WITH float_hist AS (
-        SELECT ARRAY(
-                 SELECT CAST(x AS FLOAT64)
-                 FROM UNNEST(speed_hist_int) AS x
-               ) AS fh
-      )
-      -- 2️⃣ histogram → 19 float percentiles (mph) → metres/hour ints
+      /* cast histogram INT64 → FLOAT64 for histToPercentiles_js() */
       SELECT ARRAY(
-               SELECT CAST(ROUND(p * 1609.34) AS INT64)
-               FROM UNNEST(
-                 `stl-datascience.ma_tt.histToPercentiles_js`(
-                   (SELECT fh FROM float_hist)
-                 )
-               ) AS p
-             )
+        SELECT CAST(ROUND(p * 1609.34) AS INT64)                    -- mph → m/h
+        FROM UNNEST(
+          `stl-datascience.ma_tt.histToPercentiles_js`(
+            ARRAY(SELECT CAST(x AS FLOAT64) FROM UNNEST(speed_hist_int) AS x)
+          )
+        ) AS p
+      )
     )
   END AS speedPercentiles
 FROM hist;
