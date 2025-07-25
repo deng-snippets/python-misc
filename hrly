@@ -6,10 +6,10 @@ WITH slices AS (
     dsegId,
     geohash,
     TIMESTAMP_TRUNC(dateHour, HOUR) AS hr,
-    sampleSize                                             AS n,
-    averageSpeedMetersPerHour                              AS v_arith,
-    harmonicAverageSpeedMetersPerHour                      AS v_harm,
-    tomtom.arrayMetersToMiles(speedPercentiles)            AS sp_mph
+    sampleSize                                           AS n,
+    averageSpeedMetersPerHour                            AS v_arith,
+    harmonicAverageSpeedMetersPerHour                    AS v_harm,
+    tomtom.arrayMetersToMiles(speedPercentiles)          AS sp_mph
   FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
 ),
 sim AS (
@@ -24,17 +24,17 @@ sim AS (
       WHEN ARRAY_LENGTH(sp_mph) = 19 THEN tomtom.resampleSpeedValues(
         tomtom.midpointMethodInt(
           sp_mph,
-          CAST(GREATEST(0, sp_mph[SAFE_OFFSET(0)]
-                          - 1.2 * (sp_mph[SAFE_OFFSET(1)]
-                                   - sp_mph[SAFE_OFFSET(0)])) AS INT64),
-          CAST(sp_mph[SAFE_OFFSET(18)]
-               + 1.2 * (sp_mph[SAFE_OFFSET(18)]
-                        - sp_mph[SAFE_OFFSET(17)]) AS INT64)
+          CAST(GREATEST(0,
+                sp_mph[SAFE_OFFSET(0)]
+              - 1.2 * (sp_mph[SAFE_OFFSET(1)] - sp_mph[SAFE_OFFSET(0)])) AS INT64),
+          CAST(
+                sp_mph[SAFE_OFFSET(18)]
+              + 1.2 * (sp_mph[SAFE_OFFSET(18)] - sp_mph[SAFE_OFFSET(17)]) AS INT64)
         ),
         GREATEST(CAST(ROUND(n) AS INT64), 1)
       )
       ELSE ARRAY(
-        SELECT CAST(ROUND(v_arith / 1609.34) AS INT64)
+        SELECT CAST(v_arith / 1609.34 AS INT64)
         FROM UNNEST(GENERATE_ARRAY(1, CAST(n AS INT64)))
       )
     END AS sims_mph
