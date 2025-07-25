@@ -1,28 +1,25 @@
 -- ─────────────────────────────────────────────────────────────
---  Hour-level aggregation from 15-minute table (geo6)
---  • Midpoint → Resample → speedVals2Counts → histToPercentiles_js
---  • Units returned = metres / hour  (INT64)
---  • Keeps the row even when all four slices lack a distribution
+-- Hour-level aggregation  (midpoint → resample → histogram → P-array)
+-- Units everywhere: metres / hour (INT64)
+-- No APPROX_QUANTILES anywhere
 -- ─────────────────────────────────────────────────────────────
 CREATE OR REPLACE TABLE
   `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
-PARTITION BY TIMESTAMP_TRUNC(dateHour,  MONTH)
-CLUSTER BY  geohash, dsegId, dateHour AS
+PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
+CLUSTER BY geohash, dsegId, dateHour AS
 
-/* 1 ───────── explode 15-minute slices ─────────────────────── */
 WITH slices AS (
   SELECT
     dsegId,
     geohash,
-    TIMESTAMP_TRUNC(dateHour, HOUR)                         AS hr,
-    sampleSize                                              AS n,
-    averageSpeedMetersPerHour                               AS v_arith,
-    harmonicAverageSpeedMetersPerHour                       AS v_harm,
-    tomtom.arrayMetersToMiles(speedPercentiles)             AS sp_mph        -- may be []
+    TIMESTAMP_TRUNC(dateHour, HOUR)                        AS hr,
+    sampleSize                                             AS n,
+    averageSpeedMetersPerHour                              AS v_arith,
+    harmonicAverageSpeedMetersPerHour                      AS v_harm,
+    tomtom.arrayMetersToMiles(speedPercentiles)            AS sp_mph      -- may be []
   FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
 ),
 
-/* 2 ───────── slice-level synthetic probes (mph) ───────────── */
 sim AS (
   SELECT
     dsegId,
@@ -37,47 +34,45 @@ sim AS (
         tomtom.midpointMethodInt(
           sp_mph,
           CAST(GREATEST(
-                0,
-                sp_mph[OFFSET(0)]
-              - 1.2 * (sp_mph[OFFSET(1)] - sp_mph[OFFSET(0)])) AS INT64),
+                 0,
+                 sp_mph[OFFSET(0)]
+                 - 1.2 * (sp_mph[OFFSET(1)] - sp_mph[OFFSET(0)])) AS INT64),
           CAST(
-                sp_mph[OFFSET(18)]
-              + 1.2 * (sp_mph[OFFSET(18)] - sp_mph[OFFSET(17)])
+                 sp_mph[OFFSET(18)]
+                 + 1.2 * (sp_mph[OFFSET(18)] - sp_mph[OFFSET(17)])
               AS INT64)
         ),
         GREATEST(CAST(ROUND(n) AS INT64), 1)
       ),
-      []                  -- TomTom writes no dist → empty array
+      []            -- slice has no distribution → empty
     ) AS sims_mph
   FROM slices
 ),
 
-/* 3 ───────── numeric merges & probe concatenation ─────────── */
 agg AS (
   SELECT
     dsegId,
     geohash,
-    hr                                              AS dateHour,
-    SUM(n)                                          AS total_sampleSize,
-    SAFE_DIVIDE(SUM(n * v_arith), SUM(n))           AS avgSpeedMetersPerHour,
-    SAFE_DIVIDE(SUM(n), SUM(n / NULLIF(v_harm, 0))) AS harmSpeedMetersPerHour,
-    ARRAY_CONCAT_AGG(sims_mph)                      AS all_sims_mph
+    hr                                           AS dateHour,
+    SUM(n)                                       AS total_sampleSize,
+    SAFE_DIVIDE(SUM(n * v_arith), SUM(n))        AS avgSpeedMetersPerHour,
+    SAFE_DIVIDE(SUM(n), SUM(n / NULLIF(v_harm,0)))
+                                                 AS harmSpeedMetersPerHour,
+    ARRAY_CONCAT_AGG(sims_mph)                   AS all_sims_mph
   FROM sim
   GROUP BY dsegId, geohash, hr
 ),
 
-/* 4 ───────── histogram (INT64); guard against empty probe set */
 hist AS (
   SELECT
     *,
     CASE
-      WHEN ARRAY_LENGTH(all_sims_mph) = 0 THEN []                 -- no probes
-      ELSE tomtom.speedVals2Counts(all_sims_mph)                  -- INT64[130]
+      WHEN ARRAY_LENGTH(all_sims_mph) = 0 THEN []                -- no probes
+      ELSE tomtom.speedVals2Counts(all_sims_mph)                 -- INT64[<=130]
     END AS speed_hist_int
   FROM agg
 )
 
-/* 5 ───────── histogram → 19-bin percentiles (m / h ints) ──── */
 SELECT
   dsegId,
   geohash,
@@ -86,25 +81,25 @@ SELECT
   avgSpeedMetersPerHour,
   harmSpeedMetersPerHour,
 
+  /* ── 19-bin percentile array (metres / hour INT64) ───────── */
   CASE
-    -- empty histogram OR all buckets zero  → return []
-    WHEN ARRAY_LENGTH(speed_hist_int) = 0
+    -- guard against  (a) missing histogram,   (b) <130 buckets,   (c) all-zero
+    WHEN ARRAY_LENGTH(speed_hist_int) < 130
          OR (SELECT SUM(b) FROM UNNEST(speed_hist_int) AS b) = 0
     THEN []
 
     ELSE (
-      -- cast INT64 histogram → FLOAT64, run JS UDF, convert mph → m/h ints
       SELECT ARRAY(
-               SELECT CAST(ROUND(p * 1609.34) AS INT64)
+               SELECT CAST(ROUND(p * 1609.34) AS INT64)          -- mph → m/h
                FROM UNNEST(
                  `stl-datascience.ma_tt.histToPercentiles_js`(
                    ARRAY(
-                     SELECT CAST(b AS FLOAT64)
+                     SELECT CAST(b AS FLOAT64)                   -- INT64 → F64
                      FROM UNNEST(speed_hist_int) AS b
                    )
                  )
                ) AS p
              )
     )
-  END                                            AS speedPercentiles
+  END AS speedPercentiles
 FROM hist;
