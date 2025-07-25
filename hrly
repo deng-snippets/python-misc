@@ -1,25 +1,17 @@
--- ─────────────────────────────────────────────────────────────
--- Hour-level aggregation  (midpoint → resample → histogram)
--- Units returned: metres/hour  (INT64)
--- No APPROX_QUANTILES anywhere
--- ─────────────────────────────────────────────────────────────
-CREATE OR REPLACE TABLE
-  `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
+CREATE OR REPLACE TABLE `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
 PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
 CLUSTER BY geohash, dsegId, dateHour AS
-
 WITH slices AS (
   SELECT
     dsegId,
     geohash,
-    TIMESTAMP_TRUNC(dateHour, HOUR)                       AS hr,
-    sampleSize                                            AS n,
-    averageSpeedMetersPerHour                             AS v_arith,
-    harmonicAverageSpeedMetersPerHour                     AS v_harm,
-    tomtom.arrayMetersToMiles(speedPercentiles)           AS sp_mph
+    TIMESTAMP_TRUNC(dateHour, HOUR) AS hr,
+    sampleSize                                             AS n,
+    averageSpeedMetersPerHour                              AS v_arith,
+    harmonicAverageSpeedMetersPerHour                      AS v_harm,
+    tomtom.arrayMetersToMiles(speedPercentiles)            AS sp_mph
   FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
 ),
-
 sim AS (
   SELECT
     dsegId,
@@ -28,33 +20,26 @@ sim AS (
     n,
     v_arith,
     v_harm,
-
     CASE
-      WHEN ARRAY_LENGTH(sp_mph) = 19 THEN
-           tomtom.resampleSpeedValues(
-             tomtom.midpointMethodInt(
-               sp_mph,
-               CAST(GREATEST(
-                     0,
-                     sp_mph[SAFE_OFFSET(0)]
-                   - 1.2 * (sp_mph[SAFE_OFFSET(1)] - sp_mph[SAFE_OFFSET(0)])) AS INT64),
-               CAST(
-                     sp_mph[SAFE_OFFSET(18)]
-                   + 1.2 * (sp_mph[SAFE_OFFSET(18)] - sp_mph[SAFE_OFFSET(17)])
-                 AS INT64)
-             ),
-             GREATEST(CAST(ROUND(n) AS INT64), 1)
-           )
-
-      /* replicate the slice mean (mph) once per probe */
+      WHEN ARRAY_LENGTH(sp_mph) = 19 THEN tomtom.resampleSpeedValues(
+        tomtom.midpointMethodInt(
+          sp_mph,
+          CAST(GREATEST(0, sp_mph[SAFE_OFFSET(0)]
+                          - 1.2 * (sp_mph[SAFE_OFFSET(1)]
+                                   - sp_mph[SAFE_OFFSET(0)])) AS INT64),
+          CAST(sp_mph[SAFE_OFFSET(18)]
+               + 1.2 * (sp_mph[SAFE_OFFSET(18)]
+                        - sp_mph[SAFE_OFFSET(17)]) AS INT64)
+        ),
+        GREATEST(CAST(ROUND(n) AS INT64), 1)
+      )
       ELSE ARRAY(
-             SELECT v_arith / 1609.34
-             FROM UNNEST(GENERATE_ARRAY(1, CAST(n AS INT64)))
-           )
+        SELECT CAST(ROUND(v_arith / 1609.34) AS INT64)
+        FROM UNNEST(GENERATE_ARRAY(1, CAST(n AS INT64)))
+      )
     END AS sims_mph
   FROM slices
 ),
-
 agg AS (
   SELECT
     dsegId,
@@ -67,14 +52,12 @@ agg AS (
   FROM sim
   GROUP BY dsegId, geohash, hr
 ),
-
 hist AS (
   SELECT
     *,
-    tomtom.speedVals2Counts(all_sims_mph)        AS speed_hist_int   -- INT64[130] or []
+    tomtom.speedVals2Counts(all_sims_mph)        AS speed_hist_int
   FROM agg
 )
-
 SELECT
   dsegId,
   geohash,
@@ -82,22 +65,17 @@ SELECT
   total_sampleSize,
   avgSpeedMetersPerHour,
   harmSpeedMetersPerHour,
-
-  /* 19-bin percentiles in metres/hour (INT64) */
   CASE
     WHEN ARRAY_LENGTH(speed_hist_int) < 130
          OR (SELECT SUM(b) FROM UNNEST(speed_hist_int) AS b) = 0
-    THEN CAST([] AS ARRAY<INT64>)                                -- <<< typed []
+    THEN CAST([] AS ARRAY<INT64>)
     ELSE ARRAY(
-           SELECT CAST(ROUND(p * 1609.34) AS INT64)              -- mph → m/h
-           FROM UNNEST(
-                  `stl-datascience.ma_tt.histToPercentiles_js`(
-                    ARRAY(
-                      SELECT CAST(b AS FLOAT64)
-                      FROM UNNEST(speed_hist_int) AS b
-                    )
-                  )
-                ) AS p
-         )
+      SELECT CAST(ROUND(p * 1609.34) AS INT64)
+      FROM UNNEST(
+        `stl-datascience.ma_tt.histToPercentiles_js`(
+          ARRAY(SELECT CAST(b AS FLOAT64) FROM UNNEST(speed_hist_int) AS b)
+        )
+      ) AS p
+    )
   END AS speedPercentiles
 FROM hist;
