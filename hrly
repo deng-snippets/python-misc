@@ -1,20 +1,4 @@
-CREATE OR REPLACE TABLE
-  `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
-PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
-CLUSTER BY geohash, dsegId, dateHour AS
-
-WITH slices AS (
-  SELECT
-    dsegId,
-    geohash,
-    TIMESTAMP_TRUNC(dateHour, HOUR)                       AS hr,
-    sampleSize                                            AS n,
-    averageSpeedMetersPerHour                             AS v_arith,
-    harmonicAverageSpeedMetersPerHour                     AS v_harm,
-    tomtom.arrayMetersToMiles(speedPercentiles)           AS sp_mph
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-),
-
+/***** only the slice-simulation part changes *****/
 sim AS (
   SELECT
     dsegId,
@@ -40,47 +24,9 @@ sim AS (
              ),
              GREATEST(CAST(ROUND(n) AS INT64), 1)
            )
-      -- fallback: replicate slice mean (mph) once per probe
-      ELSE ARRAY_REPEATED(v_arith / 1609.34, GREATEST(CAST(n AS INT64),1))
+
+      /* correct function name ↓↓↓ */
+      ELSE ARRAY_REPEAT(v_arith / 1609.34, GREATEST(CAST(n AS INT64),1))
     END AS sims_mph
   FROM slices
-),
-
-agg AS (
-  SELECT
-    dsegId,
-    geohash,
-    hr                                            AS dateHour,
-    SUM(n)                                        AS total_sampleSize,
-    SAFE_DIVIDE(SUM(n * v_arith), SUM(n))         AS avgSpeedMetersPerHour,
-    SAFE_DIVIDE(SUM(n), SUM(n / NULLIF(v_harm,0)))AS harmSpeedMetersPerHour,
-    ARRAY_CONCAT_AGG(sims_mph)                    AS all_sims_mph
-  FROM sim
-  GROUP BY dsegId, geohash, hr
-),
-
-hist AS (
-  SELECT
-    *,
-    tomtom.speedVals2Counts(all_sims_mph)         AS speed_hist_int
-  FROM agg
 )
-
-SELECT
-  dsegId,
-  geohash,
-  dateHour,
-  total_sampleSize,
-  avgSpeedMetersPerHour,
-  harmSpeedMetersPerHour,
-
-  /* build 19-bin percentiles, metres/h */
-  ARRAY(
-    SELECT CAST(ROUND(p * 1609.34) AS INT64)
-    FROM UNNEST(
-      `stl-datascience.ma_tt.histToPercentiles_js`(
-        ARRAY(SELECT CAST(b AS FLOAT64) FROM UNNEST(speed_hist_int) AS b)
-      )
-    ) AS p
-  ) AS speedPercentiles
-FROM hist;
