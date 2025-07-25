@@ -1,9 +1,9 @@
 -- ─────────────────────────────────────────────────────────────
---  Hour-level aggregation (final version)
---    • arithmetic average of speeds
---    • true harmonic merge
---    • percentile array back in metres/hour
---    • keeps hours even when all four slices lack percentiles
+--  Hour-level aggregation from 15-minute table (geo6)
+--  • Legacy TomTom percentile logic
+--  • Units in metres / hour everywhere
+--  • Keeps hour row even when all four slices lack percentiles
+--  • Toggle the hash-sample predicate for cheap QA runs
 -- ─────────────────────────────────────────────────────────────
 CREATE OR REPLACE TABLE
   `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
@@ -14,44 +14,48 @@ WITH slices AS (
   SELECT
     dsegId,
     geohash,
-    TIMESTAMP_TRUNC(dateHour, HOUR)             AS hour_ts,
-    sampleSize,
-    averageSpeedMetersPerHour,
-    harmonicAverageSpeedMetersPerHour,
-    tomtom.arrayMetersToMiles(speedPercentiles) AS sp_mph      -- may be []
+    TIMESTAMP_TRUNC(dateHour, HOUR)                        AS hour_ts,
+    sampleSize                                             AS n,
+    averageSpeedMetersPerHour                              AS v_arith,
+    harmonicAverageSpeedMetersPerHour                      AS v_harm,
+    -- comment-out next WHERE block for full build; keep for 0.1 % QA
+    -- WHERE MOD(ABS(FARM_FINGERPRINT(
+    --         CONCAT(CAST(dsegId AS STRING),'#',geohash,'#',
+    --                FORMAT_TIMESTAMP('%F %H:%M',dateHour))
+    --       )),1000)=0                                      -- ≈0.1 %
+    tomtom.arrayMetersToMiles(speedPercentiles)            AS sp_mph
   FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
 ),
 
-sim AS (
+simulated AS (
   SELECT
     dsegId,
     geohash,
     hour_ts,
+    n,
+    v_arith,
+    v_harm,
 
-    /* ---------- numeric accumulators ---------- */
-    sampleSize                                           AS n,
-    averageSpeedMetersPerHour                            AS v_arith,
-    harmonicAverageSpeedMetersPerHour                    AS v_harm,
-
-    /* ---------- synthetic sample array (maybe []) ---------- */
+    -- synthetic sample array (mph); empty if slice lacks percentiles
     IF(
       ARRAY_LENGTH(sp_mph) = 19,
       tomtom.resampleSpeedValues(
         tomtom.midpointMethodInt(
           sp_mph,
+          /* extrapolated min & max in mph */
           CAST(GREATEST(
             0,
-            sp_mph[OFFSET(0)]
-            - 1.2 * (sp_mph[OFFSET(1)] - sp_mph[OFFSET(0)])
+            sp_mph[OFFSET(0)] -
+            1.2 * (sp_mph[OFFSET(1)] - sp_mph[OFFSET(0)])
           ) AS INT64),
           CAST(
-            sp_mph[OFFSET(18)]
-            + 1.2 * (sp_mph[OFFSET(18)] - sp_mph[OFFSET(17)])
+            sp_mph[OFFSET(18)] +
+            1.2 * (sp_mph[OFFSET(18)] - sp_mph[OFFSET(17)])
           AS INT64)
         ),
-        GREATEST(CAST(ROUND(sampleSize) AS INT64), 1)
+        GREATEST(CAST(ROUND(n) AS INT64), 1)
       ),
-      []          -- empty when no percentile array
+      []      -- no distribution written by TomTom for this slice
     ) AS sims_mph
   FROM slices
 ),
@@ -60,21 +64,18 @@ agg AS (
   SELECT
     dsegId,
     geohash,
-    hour_ts                                   AS dateHour,
+    hour_ts                                           AS dateHour,
 
-    /* counts */
-    SUM(n)                                    AS total_sampleSize,
+    /* ---- numeric aggregates ---- */
+    SUM(n)                                            AS total_sampleSize,
 
-    /* arithmetic mean */
-    SAFE_DIVIDE(SUM(n * v_arith), SUM(n))     AS avgSpeedMetersPerHour,
+    SAFE_DIVIDE(SUM(n * v_arith), SUM(n))             AS avgSpeedMetersPerHour,
 
-    /* harmonic mean  */
-    SAFE_DIVIDE(SUM(n),
-                SUM(n / NULLIF(v_harm,0)))    AS harmSpeedMetersPerHour,
+    SAFE_DIVIDE(SUM(n), SUM(n / NULLIF(v_harm,0)))    AS harmSpeedMetersPerHour,
 
-    /* gather synthetic samples for percentile merge */
-    ARRAY_CONCAT_AGG(sims_mph)                AS all_sims_mph
-  FROM sim
+    /* concatenate all synthetic samples (may be []) */
+    ARRAY_CONCAT_AGG(sims_mph)                        AS all_sims_mph
+  FROM simulated
   GROUP BY dsegId, geohash, hour_ts
 )
 
@@ -86,91 +87,12 @@ SELECT
   avgSpeedMetersPerHour,
   harmSpeedMetersPerHour,
 
-  /* hour-level 19-bin percentiles, metres/hour; [] if no slice had dist. */
+  /* ---- 19-bin percentile array in metres / hour ---- */
   CASE
     WHEN ARRAY_LENGTH(all_sims_mph) = 0 THEN []
     ELSE (
-      SELECT APPROX_QUANTILES(val * 1609.34, 19)      -- mph → m/h
+      SELECT APPROX_QUANTILES(val * 1609.34, 19)      -- mph → m / h
       FROM UNNEST(all_sims_mph) AS val
     )
   END AS speedPercentiles
 FROM agg;
-
-
-
-
-=========
-
-2.1 Compare total sample size
-
--- Expect zero rows ⇒ counts match
-WITH slices AS (
-  SELECT dsegId, geohash,
-         TIMESTAMP_TRUNC(dateHour, HOUR) AS hr,
-         SUM(sampleSize) AS sum_samples
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-  TABLESAMPLE SYSTEM (0.1 PERCENT)
-  GROUP BY dsegId, geohash, hr
-),
-hourly AS (
-  SELECT dsegId, geohash, dateHour AS hr, total_sampleSize
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
-)
-SELECT *
-FROM hourly
-JOIN slices USING (dsegId, geohash, hr)
-WHERE total_sampleSize <> sum_samples
-LIMIT 10;
-
-
-============
-
-2.2 Compare weighted average speed (m/h)
-
--- Should return zero rows (or tiny float wiggle room)
-WITH slices AS (
-  SELECT dsegId, geohash,
-         TIMESTAMP_TRUNC(dateHour, HOUR) AS hr,
-         SAFE_DIVIDE(SUM(sampleSize * averageSpeedMetersPerHour),
-                     SUM(sampleSize))    AS avg_speed_direct
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-  TABLESAMPLE SYSTEM (0.1 PERCENT)
-  GROUP BY dsegId, geohash, hr
-),
-hourly AS (
-  SELECT dsegId, geohash, dateHour AS hr, avgSpeedMetersPerHour
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
-)
-SELECT *
-FROM hourly
-JOIN slices USING (dsegId, geohash, hr)
-WHERE ABS(avgSpeedMetersPerHour - avg_speed_direct) > 1e-6   -- tolerance
-LIMIT 10;
-
-==============
-
-2.3 Spot-check median (p50) percentiles
-
-WITH direct_p50 AS (
-  SELECT dsegId, geohash,
-         TIMESTAMP_TRUNC(dateHour, HOUR) AS hr,
-         APPROX_QUANTILES(
-           tomtom.arrayMetersToMiles(speedPercentiles), 19
-         )[SAFE_OFFSET(9)]              AS p50_direct
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-  TABLESAMPLE SYSTEM (0.1 PERCENT)
-  WHERE sampleSize IS NOT NULL
-    AND ARRAY_LENGTH(speedPercentiles)=19
-  GROUP BY dsegId, geohash, hr
-),
-hourly AS (
-  SELECT dsegId, geohash, dateHour AS hr,
-         speedPercentiles_mph[SAFE_OFFSET(9)] AS p50_hour
-  FROM `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
-)
-SELECT *
-FROM hourly
-JOIN direct_p50 USING (dsegId, geohash, hr)
--- show rows where the two p50s differ by > 1 mph
-WHERE ABS(p50_hour - p50_direct) > 1
-LIMIT 10;
