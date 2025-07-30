@@ -28,9 +28,7 @@ FOR pfx IN (SELECT g5 FROM tmp_prefixes) DO
     CAST(ROUND(q.avg_mph  * 1609.34) AS INT64)  AS avgSpeedMetersPerHour,
     CAST(ROUND(q.harm_mph * 1609.34) AS INT64)  AS harmSpeedMetersPerHour,
     CASE
-      WHEN ARRAY_LENGTH(q.hour_hist) < 130
-           OR (SELECT SUM(b) FROM UNNEST(q.hour_hist) AS b) = 0
-      THEN CAST([] AS ARRAY<INT64>)
+      WHEN ARRAY_LENGTH(q.hour_hist) = 0 THEN CAST([] AS ARRAY<INT64>)
       ELSE ARRAY(
              SELECT CAST(ROUND(p * 1609.34) AS INT64)
              FROM UNNEST(
@@ -89,13 +87,7 @@ FOR pfx IN (SELECT g5 FROM tmp_prefixes) DO
                      GREATEST(CAST(ROUND(base.sampleSize) AS INT64), 1)
                    )
                  )
-            ELSE
-                 `stl-datascience.ma_tt`.speedVals2Counts(
-                   ARRAY(
-                     SELECT CAST(ROUND(base.averageSpeedMetersPerHour / 1609.34) AS INT64)
-                     FROM UNNEST(GENERATE_ARRAY(1, CAST(base.sampleSize AS INT64)))
-                   )
-                 )
+            ELSE []
           END AS hist
         FROM `stl-datascience.varun.tt_bulk_test_geohash6_one_seg` AS base
         WHERE base.dateHour >= TIMESTAMP('2025-01-01')
