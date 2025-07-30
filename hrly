@@ -1,70 +1,90 @@
-CREATE OR REPLACE TABLE tmp.month_probes
-PARTITION BY DATE(dateHour)
-CLUSTER  BY dsegId, geohash AS
+-- one-shot monthly aggregation with TDIGEST_ADD / TDIGEST_AGG
+CREATE OR REPLACE TABLE stl-datascience.tomtom.tt_bulk_test_geohash6_hourly AS
 SELECT
   dsegId,
   geohash,
-  TIMESTAMP_TRUNC(dateHour,HOUR)                                          AS dateHour,
-  probe_mph
-FROM `stl-datascience.varun.tt_bulk_test_geohash6_one_seg`,
-UNNEST(
-  CASE
-    WHEN ARRAY_LENGTH(speedPercentiles)=19 THEN
-         tomtom.resampleSpeedValues(
-           tomtom.midpointMethodInt(
-             tomtom.arrayMetersToMiles(speedPercentiles),
-             CAST(GREATEST(
-                   0,
-                   tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(0)]
-                 - 1.2 * (tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(1)]
-                          - tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(0)])) AS INT64),
-             CAST(
-                   tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(18)]
-                 + 1.2 * (tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(18)]
-                          - tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(17)]) AS INT64)
-           ),
-           GREATEST(CAST(ROUND(sampleSize) AS INT64),1)
-         )
-    ELSE ARRAY(
-           SELECT CAST(ROUND(averageSpeedMetersPerHour/1609.34) AS INT64)
-           FROM UNNEST(GENERATE_ARRAY(1, CAST(sampleSize AS INT64)))
-         )
-  END
-) AS probe_mph
-WHERE dateHour BETWEEN '2025-01-01' AND '2025-02-01';
+  TIMESTAMP_TRUNC(dateHour,HOUR) AS dateHour,
+  SUM(sampleSize)                                                  AS total_sampleSize,
+  SAFE_DIVIDE(SUM(sampleSize * averageSpeedMetersPerHour),
+              SUM(sampleSize))                                     AS avgSpeedMetersPerHour,
+  SAFE_DIVIDE(SUM(sampleSize),
+              SUM(sampleSize / harmonicAverageSpeedMetersPerHour)) AS harmSpeedMetersPerHour,
+  ARRAY(
+    SELECT CAST(ROUND(x) AS INT64)
+    FROM UNNEST(
+      TDIGEST_QUANTILES(
+        TDIGEST_AGG(
+          CASE
+            WHEN ARRAY_LENGTH(speedPercentiles)=19 THEN
+                 TO_TDIGEST_GAUSSIAN_ARRAY(speedPercentiles)  -- TomTom helper
+            ELSE TO_TDIGEST_SCALAR(averageSpeedMetersPerHour)
+          END , sampleSize
+        ), [0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,
+            0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95]
+      )
+    ) AS x
+  )                                                               AS speedPercentiles
+FROM `stl-datascience.varun.tt_bulk_test_geohash6_one_seg`
+GROUP BY dsegId, geohash, dateHour;
+
 
 
 
 CREATE OR REPLACE TABLE stl-datascience.tomtom.tt_bulk_test_geohash6_hourly AS
-WITH per_hour AS (
+WITH slice_hist AS (
   SELECT
     dsegId,
     geohash,
-    dateHour,
-    COUNT(*)                                           AS total_sampleSize,
-    AVG(probe_mph)                                     AS mean_mph,
-    SUM(1/SAFE_CAST(probe_mph AS FLOAT64))             AS denom_harm,
-    ma_tt.speedVals2Counts(ARRAY_AGG(probe_mph))       AS hist_mph
-  FROM tmp.month_probes
-  GROUP BY dsegId, geohash, dateHour
+    TIMESTAMP_TRUNC(dateHour,HOUR) AS dateHour,
+    sampleSize                                            AS n,
+    averageSpeedMetersPerHour                             AS v_arith,
+    harmonicAverageSpeedMetersPerHour                     AS v_harm,
+    CASE
+      WHEN ARRAY_LENGTH(speedPercentiles)=19 THEN
+           ma_tt.speedVals2Counts(                      -- INT64[130]
+             tomtom.resampleSpeedValues(
+               tomtom.midpointMethodInt(
+                 tomtom.arrayMetersToMiles(speedPercentiles),
+                 CAST(GREATEST(
+                       0,
+                       tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(0)]
+                     - 1.2 * (tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(1)]
+                              - tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(0)])) AS INT64),
+                 CAST(
+                       tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(18)]
+                     + 1.2 * (tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(18)]
+                              - tomtom.arrayMetersToMiles(speedPercentiles)[SAFE_OFFSET(17)]) AS INT64)
+               ),
+               GREATEST(CAST(ROUND(sampleSize) AS INT64),1)
+             )
+           )
+      ELSE ma_tt.oneValue2Counts(
+             CAST(ROUND(averageSpeedMetersPerHour/1609.34) AS INT64), sampleSize)
+    END AS hist
+  FROM `stl-datascience.varun.tt_bulk_test_geohash6_one_seg`
 )
 SELECT
   dsegId,
   geohash,
   dateHour,
-  total_sampleSize,
-  ROUND(mean_mph*1609.34)                              AS avgSpeedMetersPerHour,
-  ROUND(total_sampleSize/denom_harm*1609.34)           AS harmSpeedMetersPerHour,
-  CASE
-    WHEN ARRAY_LENGTH(hist_mph)=0
-         OR (SELECT SUM(b) FROM UNNEST(hist_mph) AS b)=0
-    THEN CAST([] AS ARRAY<INT64>)
-    ELSE ARRAY(
-           SELECT CAST(ROUND(p*1609.34) AS INT64)
-           FROM UNNEST(
-             ma_tt.histToPercentiles_js(
-               ARRAY(SELECT CAST(b AS FLOAT64) FROM UNNEST(hist_mph) AS b)
-             )
-           ) AS p
-         )
-  END                                                  AS speedPercentiles;
+  SUM(n)                                                     AS total_sampleSize,
+  SAFE_DIVIDE(SUM(n * v_arith), SUM(n))                      AS avgSpeedMetersPerHour,
+  SAFE_DIVIDE(SUM(n), SUM(n / NULLIF(v_harm,0)))             AS harmSpeedMetersPerHour,
+  ARRAY(
+    SELECT CAST(ROUND(p * 1609.34) AS INT64)
+    FROM UNNEST(
+      ma_tt.histToPercentiles_js(
+        ARRAY(
+          SELECT CAST(SUM(bucket) AS FLOAT64)
+          FROM slice_hist sh2,
+               UNNEST(sh2.hist) WITH OFFSET pos
+          WHERE sh2.dsegId  = sh.dsegId
+            AND sh2.geohash = sh.geohash
+            AND sh2.dateHour= sh.dateHour
+            AND ORDINAL(pos) = ORDINAL(h.bucket_pos)          -- zip buckets
+        ) AS h(bucket,bucket_pos)
+      )
+    ) AS p
+  )                                                         AS speedPercentiles
+FROM slice_hist sh
+GROUP BY dsegId, geohash, dateHour;
