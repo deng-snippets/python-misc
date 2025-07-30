@@ -1,15 +1,9 @@
--- -----------------------------------------------------------
--- 0.  Collect all 5-character geohash prefixes for January 2025
--- -----------------------------------------------------------
 CREATE TEMP TABLE tmp_prefixes AS
 SELECT DISTINCT SUBSTR(geohash, 1, 5) AS g5
-FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
+FROM `stl-datascience.varun.tt_bulk_test_geohash6_one_seg`
 WHERE dateHour >= TIMESTAMP('2025-01-01')
   AND dateHour < TIMESTAMP('2025-02-01');
 
--- -----------------------------------------------------------
--- 1.  Destination table (monthly-partitioned & clustered)
--- -----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
 (
   dsegId                 STRING,
@@ -23,11 +17,8 @@ CREATE TABLE IF NOT EXISTS `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
 PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
 CLUSTER BY geohash, dsegId, dateHour;
 
--- -----------------------------------------------------------
--- 2.  Loop over every prefix and insert aggregated rows
--- -----------------------------------------------------------
 FOR pfx IN (SELECT g5 FROM tmp_prefixes) DO
-  EXECUTE IMMEDIATE '''
+  EXECUTE IMMEDIATE """
   INSERT INTO `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
   SELECT
     q.dsegId,
@@ -49,19 +40,17 @@ FOR pfx IN (SELECT g5 FROM tmp_prefixes) DO
                )
              ) AS p
            )
-    END                                           AS speedPercentiles
+    END AS speedPercentiles
   FROM (
-    -- ---------- aggregate one hour of raw rows into one record ----------
     SELECT
       b.dsegId,
       b.geohash,
       b.dateHour,
-      SUM(b.n)                                                         AS total_sampleSize,
-      SAFE_DIVIDE(SUM(b.n * b.v_arith_mph), SUM(b.n))                  AS avg_mph,
-      SAFE_DIVIDE(SUM(b.n), SUM(b.n / NULLIF(b.v_harm_mph, 0)))        AS harm_mph,
-      ARRAY_AGG(b.bucket_sum ORDER BY b.idx)                           AS hour_hist
+      SUM(b.n) AS total_sampleSize,
+      SAFE_DIVIDE(SUM(b.n * b.v_arith_mph), SUM(b.n)) AS avg_mph,
+      SAFE_DIVIDE(SUM(b.n), SUM(b.n / NULLIF(b.v_harm_mph, 0))) AS harm_mph,
+      ARRAY_AGG(b.bucket_sum ORDER BY b.idx) AS hour_hist
     FROM (
-      -- ---------- explode each histogram into individual buckets ----------
       SELECT
         a.dsegId,
         a.geohash,
@@ -72,14 +61,13 @@ FOR pfx IN (SELECT g5 FROM tmp_prefixes) DO
         idx,
         SUM(bucket) AS bucket_sum
       FROM (
-        -- ---------- read raw rows and turn them into histograms ----------
         SELECT
           base.dsegId,
           base.geohash,
-          TIMESTAMP_TRUNC(base.dateHour, HOUR)                         AS dateHour,
-          base.sampleSize                                              AS n,
-          base.averageSpeedMetersPerHour  / 1609.34                    AS v_arith_mph,
-          base.harmonicAverageSpeedMetersPerHour / 1609.34             AS v_harm_mph,
+          TIMESTAMP_TRUNC(base.dateHour, HOUR) AS dateHour,
+          base.sampleSize AS n,
+          base.averageSpeedMetersPerHour / 1609.34 AS v_arith_mph,
+          base.harmonicAverageSpeedMetersPerHour / 1609.34 AS v_harm_mph,
           CASE
             WHEN ARRAY_LENGTH(base.speedPercentiles) = 19 THEN
                  `stl-datascience.ma_tt`.speedVals2Counts(
@@ -109,15 +97,16 @@ FOR pfx IN (SELECT g5 FROM tmp_prefixes) DO
                    )
                  )
           END AS hist
-        FROM `stl-datascience.tomtom.tt_bulk_test_geohash6` AS base
+        FROM `stl-datascience.varun.tt_bulk_test_geohash6_one_seg` AS base
         WHERE base.dateHour >= TIMESTAMP('2025-01-01')
-          AND base.dateHour <  TIMESTAMP('2025-02-01')
+          AND base.dateHour < TIMESTAMP('2025-02-01')
           AND SUBSTR(base.geohash, 1, 5) = @pref
       ) AS a
-      UNNEST(a.hist) AS bucket WITH OFFSET AS idx
-      GROUP BY a.dsegId, a.geohash, a.dateHour, idx, a.n, a.v_arith_mph, a.v_harm_mph
+      CROSS JOIN UNNEST(a.hist) AS bucket WITH OFFSET idx
+      GROUP BY a.dsegId, a.geohash, a.dateHour, idx,
+               a.n, a.v_arith_mph, a.v_harm_mph
     ) AS b
     GROUP BY b.dsegId, b.geohash, b.dateHour
   ) AS q;
-  ''' USING pfx.g5 AS pref;      -- bind this loop's prefix value to @pref
+  """ USING pfx.g5 AS pref;
 END FOR;
