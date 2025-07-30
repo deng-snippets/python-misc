@@ -1,13 +1,46 @@
-CREATE OR REPLACE TABLE `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
+-- Build hourly table for January 2025 in geohash-5 chunks
+-- Raw 15-minute table:  stl-datascience.tomtom.tt_bulk_test_geohash6
+-- Output table:         stl-datascience.tomtom.tt_bulk_test_geohash6_hourly
+
+--------------------------------------------------------------------------------
+-- 0.  Prefix list for the month (geohash-5)
+--------------------------------------------------------------------------------
+CREATE TEMP TABLE tmp_prefixes AS
+SELECT DISTINCT SUBSTR(geohash,1,5) AS g5
+FROM   `stl-datascience.tomtom.tt_bulk_test_geohash6`
+WHERE  dateHour >= TIMESTAMP('2025-01-01')
+  AND  dateHour < TIMESTAMP('2025-02-01');
+
+--------------------------------------------------------------------------------
+-- 1.  Destination table (partition & cluster only once)
+--------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
+(
+  dsegId                 STRING,
+  geohash                STRING,
+  dateHour               TIMESTAMP,
+  total_sampleSize       INT64,
+  avgSpeedMetersPerHour  INT64,
+  harmSpeedMetersPerHour INT64,
+  speedPercentiles       ARRAY<INT64>
+)
 PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
-CLUSTER BY geohash, dsegId, dateHour AS
+CLUSTER BY  geohash, dsegId, dateHour;
+
+--------------------------------------------------------------------------------
+-- 2.  Loop over every geohash-5 prefix and insert its hours
+--------------------------------------------------------------------------------
+DECLARE pfx STRING;
+FOR pfx IN (SELECT g5 FROM tmp_prefixes) DO
+
+INSERT INTO `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
 SELECT
   q.dsegId,
   q.geohash,
   q.dateHour,
   q.total_sampleSize,
-  CAST(ROUND(q.avg_mph * 1609.34)  AS INT64)                          AS avgSpeedMetersPerHour,
-  CAST(ROUND(q.harm_mph * 1609.34) AS INT64)                          AS harmSpeedMetersPerHour,
+  CAST(ROUND(q.avg_mph  * 1609.34) AS INT64)                         AS avgSpeedMetersPerHour,
+  CAST(ROUND(q.harm_mph * 1609.34) AS INT64)                         AS harmSpeedMetersPerHour,
   CASE
     WHEN ARRAY_LENGTH(q.hour_hist) < 130
          OR (SELECT SUM(b) FROM UNNEST(q.hour_hist) AS b)=0
@@ -16,20 +49,23 @@ SELECT
            SELECT CAST(ROUND(p * 1609.34) AS INT64)
            FROM UNNEST(
              `stl-datascience.ma_tt.histToPercentiles_js`(
-               ARRAY(SELECT CAST(b AS FLOAT64) FROM UNNEST(q.hour_hist) AS b)
+               ARRAY(
+                 SELECT CAST(b AS FLOAT64)
+                 FROM UNNEST(q.hour_hist) AS b
+               )
              )
            ) AS p
          )
-  END                                                                  AS speedPercentiles
+  END                                                                AS speedPercentiles
 FROM (
   SELECT
     b.dsegId,
     b.geohash,
     b.dateHour,
-    SUM(b.n)                                                           AS total_sampleSize,
-    SAFE_DIVIDE(SUM(b.n * b.v_arith_mph), SUM(b.n))                    AS avg_mph,
-    SAFE_DIVIDE(SUM(b.n), SUM(b.n / NULLIF(b.v_harm_mph,0)))           AS harm_mph,
-    ARRAY_AGG(b.bucket_sum ORDER BY b.idx)                             AS hour_hist
+    SUM(b.n)                                                         AS total_sampleSize,
+    SAFE_DIVIDE(SUM(b.n * b.v_arith_mph), SUM(b.n))                  AS avg_mph,
+    SAFE_DIVIDE(SUM(b.n), SUM(b.n / NULLIF(b.v_harm_mph,0)))         AS harm_mph,
+    ARRAY_AGG(b.bucket_sum ORDER BY b.idx)                           AS hour_hist
   FROM (
     SELECT
       a.dsegId,
@@ -39,15 +75,15 @@ FROM (
       a.v_arith_mph,
       a.v_harm_mph,
       idx,
-      SUM(bucket)                                                      AS bucket_sum
+      SUM(bucket)                                                    AS bucket_sum
     FROM (
       SELECT
         base.dsegId,
         base.geohash,
-        TIMESTAMP_TRUNC(base.dateHour,HOUR)                            AS dateHour,
-        base.sampleSize                                                AS n,
-        base.averageSpeedMetersPerHour  / 1609.34                      AS v_arith_mph,
-        base.harmonicAverageSpeedMetersPerHour / 1609.34               AS v_harm_mph,
+        TIMESTAMP_TRUNC(base.dateHour,HOUR)                          AS dateHour,
+        base.sampleSize                                              AS n,
+        base.averageSpeedMetersPerHour/1609.34                       AS v_arith_mph,
+        base.harmonicAverageSpeedMetersPerHour/1609.34               AS v_harm_mph,
         CASE
           WHEN ARRAY_LENGTH(base.speedPercentiles)=19 THEN
                `stl-datascience.ma_tt`.speedVals2Counts(
@@ -57,12 +93,14 @@ FROM (
                      CAST(GREATEST(
                            0,
                            tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)]
-                         - 1.2 * (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(1)]
-                                  - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)])) AS INT64),
+                         - 1.2 * (
+                             tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(1)]
+                           - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)])) AS INT64),
                      CAST(
                            tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)]
-                         + 1.2 * (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)]
-                                  - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(17)]) AS INT64)
+                         + 1.2 * (
+                             tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)]
+                           - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(17)]) AS INT64)
                    ),
                    GREATEST(CAST(ROUND(base.sampleSize) AS INT64),1)
                  )
@@ -75,10 +113,15 @@ FROM (
                  )
                )
         END                                                           AS hist
-      FROM `stl-datascience.varun.tt_bulk_test_geohash6_one_seg` AS base
+      FROM `stl-datascience.tomtom.tt_bulk_test_geohash6` AS base
+      WHERE base.dateHour >= TIMESTAMP('2025-01-01')
+        AND base.dateHour < TIMESTAMP('2025-02-01')
+        AND SUBSTR(base.geohash,1,5) = pfx
     ) AS a,
     UNNEST(a.hist) WITH OFFSET AS idx
     GROUP BY a.dsegId, a.geohash, a.dateHour, idx, a.n, a.v_arith_mph, a.v_harm_mph
   ) AS b
   GROUP BY b.dsegId, b.geohash, b.dateHour
 ) AS q;
+
+END FOR;
