@@ -1,89 +1,134 @@
-CREATE TEMP TABLE tmp_prefixes AS
-SELECT DISTINCT SUBSTR(geohash, 1, 5) AS g5
-FROM `stl-datascience.tomtom.tt_bulk_test_geohash6`
-WHERE dateHour >= TIMESTAMP('2025-01-01')
-  AND dateHour < TIMESTAMP('2025-02-01');
+# ------------------------------------------------------------
+# bigquery_bulk_hourly_insert.py
+# ------------------------------------------------------------
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.cloud import bigquery
+import datetime
 
-CREATE TABLE IF NOT EXISTS `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
-(
-  dsegId                 STRING,
-  geohash                STRING,
-  dateHour               TIMESTAMP,
-  sampleSize             INT64,
-  avgSpeedMetersPerHour  INT64,
-  harmSpeedMetersPerHour INT64,
-  speedPercentiles       ARRAY<INT64>
-)
-PARTITION BY TIMESTAMP_TRUNC(dateHour, MONTH)
-CLUSTER BY geohash, dsegId, dateHour;
+PROJECT_ID = "stl-datascience"      # change if your default project differs
+DATASET    = "tomtom"
+SRC_TABLE  = f"`{PROJECT_ID}.{DATASET}.tt_bulk_test_geohash6`"
+DST_TABLE  = f"`{PROJECT_ID}.{DATASET}.tt_bulk_test_geohash6_hourly`"
 
-FOR pfx IN (SELECT g5 FROM tmp_prefixes) DO
-  EXECUTE IMMEDIATE """
-  INSERT INTO `stl-datascience.tomtom.tt_bulk_test_geohash6_hourly`
+# ----------------------------------------------------------------------
+# 1. Build the parameterised template (identical business logic, @pfx)
+# ----------------------------------------------------------------------
+TEMPLATE_SQL = f"""
+INSERT INTO {DST_TABLE}
+SELECT
+  outer_q.dsegId,
+  outer_q.geohash,
+  outer_q.date_hr                        AS dateHour,
+  outer_q.sampleSize,
+  CAST(ROUND(outer_q.avgSpeed_mph  * 1609.34) AS INT64) AS avgSpeedMetersPerHour,
+  CAST(ROUND(outer_q.harmSpeed_mph * 1609.34) AS INT64) AS harmSpeedMetersPerHour,
+  CASE
+    WHEN ARRAY_LENGTH(outer_q.sims) = 0 THEN []
+    ELSE ARRAY(
+      SELECT CAST(ROUND(p * 1609.34) AS INT64)
+      FROM UNNEST(
+        `stl-datascience.ma_tt`.histToPercentiles_js(
+          ARRAY(
+            SELECT CAST(h AS FLOAT64)
+            FROM UNNEST(
+              `stl-datascience.ma_tt`.speedVals2Counts(outer_q.sims)
+            ) AS h
+          )
+        )
+      ) AS p
+    )
+  END AS speedPercentiles
+FROM (
   SELECT
-    outer_q.dsegId,
-    outer_q.geohash,
-    outer_q.date_hr                        AS dateHour,
-    outer_q.sampleSize                     AS sampleSize,
-    CAST(ROUND(outer_q.avgSpeed_mph  * 1609.34) AS INT64) AS avgSpeedMetersPerHour,
-    CAST(ROUND(outer_q.harmSpeed_mph * 1609.34) AS INT64) AS harmSpeedMetersPerHour,
-    CASE
-      WHEN ARRAY_LENGTH(outer_q.sims) = 0 THEN CAST([] AS ARRAY<INT64>)
-      ELSE ARRAY(
-             SELECT CAST(ROUND(p * 1609.34) AS INT64)
-             FROM UNNEST(
-               `stl-datascience.ma_tt.histToPercentiles_js`(
-                 ARRAY(
-                   SELECT CAST(h AS FLOAT64)
-                   FROM UNNEST(
-                     `stl-datascience.ma_tt.speedVals2Counts`(outer_q.sims)
-                   ) AS h
-                 )
-               )
-             ) AS p
-           )
-    END AS speedPercentiles
+    mid_q.dsegId,
+    mid_q.geohash,
+    mid_q.date_hr,
+    SUM(mid_q.n)                                          AS sampleSize,
+    SAFE_DIVIDE(SUM(mid_q.n * mid_q.v_arith_mph), SUM(mid_q.n))          AS avgSpeed_mph,
+    SAFE_DIVIDE(SUM(mid_q.n), SUM(mid_q.n / NULLIF(mid_q.v_harm_mph,0))) AS harmSpeed_mph,
+    ARRAY_CONCAT_AGG(mid_q.sims)                          AS sims
   FROM (
     SELECT
-      mid_q.dsegId,
-      mid_q.geohash,
-      mid_q.date_hr,
-      SUM(mid_q.n)                                          AS sampleSize,
-      SAFE_DIVIDE(SUM(mid_q.n * mid_q.v_arith_mph), SUM(mid_q.n))          AS avgSpeed_mph,
-      SAFE_DIVIDE(SUM(mid_q.n), SUM(mid_q.n / NULLIF(mid_q.v_harm_mph,0))) AS harmSpeed_mph,
-      ARRAY_CONCAT_AGG(mid_q.sims)                          AS sims
-    FROM (
-      SELECT
-        base.dsegId,
-        base.geohash,
-        TIMESTAMP_TRUNC(base.dateHour,HOUR)                 AS date_hr,
-        base.sampleSize                                     AS n,
-        base.averageSpeedMetersPerHour  / 1609.34           AS v_arith_mph,
-        base.harmonicAverageSpeedMetersPerHour / 1609.34    AS v_harm_mph,
-        CASE
-          WHEN ARRAY_LENGTH(base.speedPercentiles) = 19 THEN
-               tomtom.resampleSpeedValues(
-                 tomtom.midpointMethodInt(
-                   tomtom.arrayMetersToMiles(base.speedPercentiles),
-                   CAST(GREATEST(
-                         0,
-                         tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)]
-                       - 1.2 * (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(1)] - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)])) AS INT64),
-                   CAST(tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)] + 1.2 * (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)] - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(17)]) AS INT64)
-                 ),
-                 GREATEST(CAST(ROUND(base.sampleSize) AS INT64),1)
-               )
-          ELSE ARRAY(
-                 SELECT CAST(ROUND(base.averageSpeedMetersPerHour / 1609.34) AS INT64)
-                 FROM UNNEST(GENERATE_ARRAY(1, CAST(base.sampleSize AS INT64)))
-               )
-        END AS sims
-      FROM `stl-datascience.tomtom.tt_bulk_test_geohash6` AS base
-      WHERE base.dateHour >= TIMESTAMP('2025-01-01')
-        AND base.dateHour < TIMESTAMP('2025-02-01')
-        AND SUBSTR(base.geohash, 1, 5) = @pref
-    ) AS mid_q
-    GROUP BY mid_q.dsegId, mid_q.geohash, mid_q.date_hr
-  ) AS outer_q;
-  """ USING pfx.g5 AS pref;
-END FOR;
+      base.dsegId,
+      base.geohash,
+      TIMESTAMP_TRUNC(base.dateHour,HOUR)                 AS date_hr,
+      base.sampleSize                                     AS n,
+      base.averageSpeedMetersPerHour  / 1609.34           AS v_arith_mph,
+      base.harmonicAverageSpeedMetersPerHour / 1609.34    AS v_harm_mph,
+      CASE
+        WHEN ARRAY_LENGTH(base.speedPercentiles) = 19 THEN
+             tomtom.resampleSpeedValues(
+               tomtom.midpointMethodInt(
+                 tomtom.arrayMetersToMiles(base.speedPercentiles),
+                 CAST(GREATEST(
+                       0,
+                       tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)]
+                     - 1.2 * (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(1)]
+                              - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)])) AS INT64),
+                 CAST(
+                       tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)]
+                     + 1.2 * (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)]
+                              - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(17)]) AS INT64)
+               ),
+               GREATEST(CAST(ROUND(base.sampleSize) AS INT64),1)
+             )
+        ELSE ARRAY(
+               SELECT CAST(ROUND(base.averageSpeedMetersPerHour / 1609.34) AS INT64)
+               FROM UNNEST(GENERATE_ARRAY(1, CAST(base.sampleSize AS INT64)))
+             )
+      END AS sims
+    FROM {SRC_TABLE} AS base
+    WHERE base.dateHour >= TIMESTAMP('2025-01-01')
+      AND base.dateHour <  TIMESTAMP('2025-02-01')
+      AND SUBSTR(base.geohash, 1, 2) = @pfx               -- <<<<<< parameter
+  ) AS mid_q
+  GROUP BY mid_q.dsegId, mid_q.geohash, mid_q.date_hr
+) AS outer_q
+"""
+
+# ----------------------------------------------------------------------
+# 2. Fetch the distinct 2-character prefixes we need to run
+# ----------------------------------------------------------------------
+def fetch_prefixes(client) -> list[str]:
+    prefix_query = f"""
+        SELECT DISTINCT SUBSTR(geohash,1,2) AS pfx
+        FROM {SRC_TABLE}
+        WHERE dateHour >= TIMESTAMP('2025-01-01')
+          AND dateHour <  TIMESTAMP('2025-02-01')
+        ORDER BY pfx
+    """
+    result = client.query(prefix_query).result()
+    return [row["pfx"] for row in result]
+
+# ----------------------------------------------------------------------
+# 3. Launch one job per prefix (in parallel)
+# ----------------------------------------------------------------------
+def run_prefix_job(client: bigquery.Client, prefix: str):
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("pfx", "STRING", prefix)
+        ],
+        write_disposition="WRITE_APPEND",   # keep appending hourly rows
+    )
+    job = client.query(TEMPLATE_SQL, job_config=job_config)
+    job.result()  # wait
+    return prefix, job
+
+def main():
+    client = bigquery.Client(project=PROJECT_ID)
+    prefixes = fetch_prefixes(client)
+    print(f"{datetime.datetime.utcnow():%H:%M:%S} – launching {len(prefixes)} jobs…")
+
+    # Limit workers to something sane; 16–32 is usually sweet-spot
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        future_map = {pool.submit(run_prefix_job, client, p): p for p in prefixes}
+        for future in as_completed(future_map):
+            pfx = future_map[future]
+            try:
+                _, job = future.result()
+                print(f"[✔] {pfx} – {job.num_dml_affected_rows or 0} rows")
+            except Exception as exc:
+                print(f"[✖] {pfx} – {exc}")
+
+if __name__ == "__main__":
+    main()
