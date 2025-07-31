@@ -1,16 +1,16 @@
 TEMPLATE_SQL = f"""
 INSERT INTO {DST_TABLE}
 (dsegId, geohash, dateHour, sampleSize,
- avgSpeedMetersPerHour, harmSpeedMetersPerHour, speedPercentiles)
+ averageSpeedMetersPerHour, harmonicAverageSpeedMetersPerHour, speedPercentiles)
 SELECT
   outer_q.dsegId,
   outer_q.geohash,
   outer_q.date_hr                                          AS dateHour,
   outer_q.sampleSize,
-  CAST(ROUND(outer_q.avgSpeed_mph  * 1609.34) AS INT64)    AS avgSpeedMetersPerHour,
-  CAST(ROUND(outer_q.harmSpeed_mph * 1609.34) AS INT64)    AS harmSpeedMetersPerHour,
+  CAST(ROUND(outer_q.avgSpeed_mph  * 1609.34) AS INT64)    AS averageSpeedMetersPerHour,
+  CAST(ROUND(outer_q.harmSpeed_mph * 1609.34) AS INT64)    AS harmonicAverageSpeedMetersPerHour,
   CASE
-    WHEN outer_q.sampleSize = 1 THEN []                    -- suppress meaningless array
+    WHEN outer_q.sampleSize = 1 THEN []
     ELSE ARRAY(
       SELECT CAST(ROUND(p * 1609.34) AS INT64)
       FROM UNNEST(
@@ -67,7 +67,7 @@ FROM (
     FROM {SRC_TABLE} AS base
     WHERE base.dateHour >= TIMESTAMP('2025-01-01')
       AND base.dateHour <  TIMESTAMP('2025-02-01')
-      AND geohash LIKE CONCAT(@pfx, '%')                  -- cluster-friendly filter
+      AND geohash LIKE CONCAT(@pfx, '%')                  -- cluster-friendly
   ) AS mid_q
   GROUP BY mid_q.dsegId, mid_q.geohash, mid_q.date_hr
 ) AS outer_q
