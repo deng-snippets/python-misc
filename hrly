@@ -1,19 +1,65 @@
+#!/usr/bin/env python3
 # ------------------------------------------------------------
-# bigquery_bulk_hourly_insert.py
+# fetch_prefixes.py  – save geohash-2 prefixes locally
+# ------------------------------------------------------------
+from google.cloud import bigquery
+import json
+from pathlib import Path
+
+PROJECT_ID = "stl-datascience"
+DATASET    = "tomtom"
+SRC_TABLE  = f"`{PROJECT_ID}.{DATASET}.tt_bulk_test_geohash6`"
+OUT_FILE   = Path("prefixes.json")
+
+client = bigquery.Client(project=PROJECT_ID)
+
+query = f"""
+SELECT DISTINCT SUBSTR(geohash,1,2) AS pfx
+FROM {SRC_TABLE}
+WHERE dateHour >= TIMESTAMP('2025-01-01')
+  AND dateHour <  TIMESTAMP('2025-02-01')
+ORDER BY pfx
+"""
+prefixes = [row["pfx"] for row in client.query(query).result()]
+OUT_FILE.write_text(json.dumps(prefixes, indent=2))
+print(f"Saved {len(prefixes)} prefixes → {OUT_FILE.resolve()}")
+
+
+-------------
+
+
+#!/usr/bin/env python3
+# ------------------------------------------------------------
+# run_hourly_jobs.py  – parallel INSERTs + progress tracking
 # ------------------------------------------------------------
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import bigquery
+from pathlib import Path
+import json
 import datetime
+import threading
 
-PROJECT_ID = "stl-datascience"      # change if your default project differs
+PROJECT_ID = "stl-datascience"
 DATASET    = "tomtom"
 SRC_TABLE  = f"`{PROJECT_ID}.{DATASET}.tt_bulk_test_geohash6`"
 DST_TABLE  = f"`{PROJECT_ID}.{DATASET}.tt_bulk_test_geohash6_hourly`"
+PFX_FILE   = Path("prefixes.json")
+DONE_FILE  = Path("processed_prefixes.json")
+MAX_WORKERS = 32      # tune for your slot capacity
 
 # ----------------------------------------------------------------------
-# 1. Build the parameterised template (identical business logic, @pfx)
+# load prefix lists
 # ----------------------------------------------------------------------
-TEMPLATE_SQL = f"""
+all_prefixes = json.loads(PFX_FILE.read_text())
+processed = json.loads(DONE_FILE.read_text()) if DONE_FILE.exists() else []
+todo = [p for p in all_prefixes if p not in processed]
+
+print(f"{len(all_prefixes)} total prefixes, {len(processed)} done, {len(todo)} to run.")
+
+# ----------------------------------------------------------------------
+# BigQuery template (identical business logic, param @pfx)
+# ----------------------------------------------------------------------
+TEMPLATE_SQL = f\"\"\"                     -- (same body as before)
 INSERT INTO {DST_TABLE}
 SELECT
   outer_q.dsegId,
@@ -80,55 +126,39 @@ FROM (
     FROM {SRC_TABLE} AS base
     WHERE base.dateHour >= TIMESTAMP('2025-01-01')
       AND base.dateHour <  TIMESTAMP('2025-02-01')
-      AND SUBSTR(base.geohash, 1, 2) = @pfx               -- <<<<<< parameter
+      AND SUBSTR(base.geohash, 1, 2) = @pfx
   ) AS mid_q
   GROUP BY mid_q.dsegId, mid_q.geohash, mid_q.date_hr
 ) AS outer_q
-"""
+\"\"\"  # noqa: E501
 
-# ----------------------------------------------------------------------
-# 2. Fetch the distinct 2-character prefixes we need to run
-# ----------------------------------------------------------------------
-def fetch_prefixes(client) -> list[str]:
-    prefix_query = f"""
-        SELECT DISTINCT SUBSTR(geohash,1,2) AS pfx
-        FROM {SRC_TABLE}
-        WHERE dateHour >= TIMESTAMP('2025-01-01')
-          AND dateHour <  TIMESTAMP('2025-02-01')
-        ORDER BY pfx
-    """
-    result = client.query(prefix_query).result()
-    return [row["pfx"] for row in result]
+client = bigquery.Client(project=PROJECT_ID)
+lock = threading.Lock()   # guard updates to processed list + file
 
-# ----------------------------------------------------------------------
-# 3. Launch one job per prefix (in parallel)
-# ----------------------------------------------------------------------
-def run_prefix_job(client: bigquery.Client, prefix: str):
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("pfx", "STRING", prefix)
-        ],
-        write_disposition="WRITE_APPEND",   # keep appending hourly rows
+def run_job(pfx: str):
+    job_cfg = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("pfx", "STRING", pfx)],
+        write_disposition="WRITE_APPEND",
     )
-    job = client.query(TEMPLATE_SQL, job_config=job_config)
+    job = client.query(TEMPLATE_SQL, job_config=job_cfg)
     job.result()  # wait
-    return prefix, job
+    with lock:
+        processed.append(pfx)
+        DONE_FILE.write_text(json.dumps(processed, indent=2))
+    return pfx, job.num_dml_affected_rows or 0
 
-def main():
-    client = bigquery.Client(project=PROJECT_ID)
-    prefixes = fetch_prefixes(client)
-    print(f"{datetime.datetime.utcnow():%H:%M:%S} – launching {len(prefixes)} jobs…")
+start = datetime.datetime.utcnow()
+print(f\"{start:%H:%M:%S} – launching {len(todo)} jobs with {MAX_WORKERS} workers…\")
 
-    # Limit workers to something sane; 16–32 is usually sweet-spot
-    with ThreadPoolExecutor(max_workers=32) as pool:
-        future_map = {pool.submit(run_prefix_job, client, p): p for p in prefixes}
-        for future in as_completed(future_map):
-            pfx = future_map[future]
-            try:
-                _, job = future.result()
-                print(f"[✔] {pfx} – {job.num_dml_affected_rows or 0} rows")
-            except Exception as exc:
-                print(f"[✖] {pfx} – {exc}")
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    futures = {pool.submit(run_job, p): p for p in todo}
+    for fut in as_completed(futures):
+        pfx = futures[fut]
+        try:
+            pfx, rows = fut.result()
+            elapsed = (datetime.datetime.utcnow() - start).seconds
+            print(f\"[{elapsed:4}s] ✔ {pfx} – {rows} rows appended\")
+        except Exception as exc:
+            print(f\"✖ {pfx} – {exc}\")
 
-if __name__ == "__main__":
-    main()
+print(\"Done. Processed prefixes list updated →\", DONE_FILE.resolve())
