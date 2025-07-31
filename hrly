@@ -9,23 +9,30 @@ SELECT
   outer_q.sampleSize,
   CAST(ROUND(outer_q.avgSpeed_mph  * 1609.34) AS INT64)    AS averageSpeedMetersPerHour,
   CAST(ROUND(outer_q.harmSpeed_mph * 1609.34) AS INT64)    AS harmonicAverageSpeedMetersPerHour,
+
+  /* ---------- percentiles with original guard restored ---------- */
   CASE
-    WHEN outer_q.sampleSize = 1 THEN []
+    WHEN ARRAY_LENGTH((
+           SELECT ARRAY_AGG(h)
+           FROM UNNEST(`stl-datascience.ma_tt`.speedVals2Counts(outer_q.sims)) AS h
+         )) < 130
+    THEN []                                                /* insufficient data → empty array */
     ELSE ARRAY(
-      SELECT CAST(ROUND(p * 1609.34) AS INT64)
-      FROM UNNEST(
-        `stl-datascience.ma_tt`.histToPercentiles_js(
-          ARRAY(
-            SELECT CAST(h AS FLOAT64)
-            FROM UNNEST(
-              `stl-datascience.ma_tt`.speedVals2Counts(outer_q.sims)
-            ) AS h
-          )
-        )
-      ) AS p
-    )
+           SELECT CAST(ROUND(p * 1609.34) AS INT64)
+           FROM UNNEST(
+             `stl-datascience.ma_tt`.histToPercentiles_js(
+               ARRAY(
+                 SELECT CAST(h AS FLOAT64)
+                 FROM UNNEST(
+                   `stl-datascience.ma_tt`.speedVals2Counts(outer_q.sims)
+                 ) AS h
+               )
+             )
+           ) AS p
+         )
   END AS speedPercentiles
 FROM (
+  /* -------------------- aggregate to hour -------------------- */
   SELECT
     mid_q.dsegId,
     mid_q.geohash,
@@ -35,6 +42,7 @@ FROM (
     SAFE_DIVIDE(SUM(mid_q.n), SUM(mid_q.n / NULLIF(mid_q.v_harm_mph,0))) AS harmSpeed_mph,
     ARRAY_CONCAT_AGG(mid_q.sims)                          AS sims
   FROM (
+    /* --------------- transform each 15-min row --------------- */
     SELECT
       base.dsegId,
       base.geohash,
@@ -50,12 +58,14 @@ FROM (
                  CAST(GREATEST(
                        0,
                        tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)]
-                     - 1.2 * (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(1)]
-                              - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)])) AS INT64),
+                     - 1.2 *
+                       (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(1)]
+                      - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(0)])) AS INT64),
                  CAST(
                        tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)]
-                     + 1.2 * (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)]
-                              - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(17)]) AS INT64)
+                     + 1.2 *
+                       (tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(18)]
+                      - tomtom.arrayMetersToMiles(base.speedPercentiles)[SAFE_OFFSET(17)]) AS INT64)
                ),
                GREATEST(CAST(ROUND(base.sampleSize) AS INT64),1)
              )
@@ -67,7 +77,7 @@ FROM (
     FROM {SRC_TABLE} AS base
     WHERE base.dateHour >= TIMESTAMP('2025-01-01')
       AND base.dateHour <  TIMESTAMP('2025-02-01')
-      AND geohash LIKE CONCAT(@pfx, '%')                  -- cluster-friendly
+      AND geohash LIKE CONCAT(@pfx, '%')                  /* cluster-friendly filter */
   ) AS mid_q
   GROUP BY mid_q.dsegId, mid_q.geohash, mid_q.date_hr
 ) AS outer_q
