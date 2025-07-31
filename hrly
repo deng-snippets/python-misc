@@ -1,75 +1,16 @@
-#!/usr/bin/env python3
-# ------------------------------------------------------------
-# fetch_prefixes.py  – save geohash-2 prefixes locally
-# ------------------------------------------------------------
-from google.cloud import bigquery
-import json
-from pathlib import Path
-
-PROJECT_ID = "stl-datascience"
-DATASET    = "tomtom"
-SRC_TABLE  = f"`{PROJECT_ID}.{DATASET}.tt_bulk_test_geohash6`"
-OUT_FILE   = Path("prefixes.json")
-
-client = bigquery.Client(project=PROJECT_ID)
-
-query = f"""
-SELECT DISTINCT SUBSTR(geohash,1,2) AS pfx
-FROM {SRC_TABLE}
-WHERE dateHour >= TIMESTAMP('2025-01-01')
-  AND dateHour <  TIMESTAMP('2025-02-01')
-ORDER BY pfx
-"""
-prefixes = [row["pfx"] for row in client.query(query).result()]
-OUT_FILE.write_text(json.dumps(prefixes, indent=2))
-print(f"Saved {len(prefixes)} prefixes → {OUT_FILE.resolve()}")
-
-
--------------
-
-
-#!/usr/bin/env python3
-# ------------------------------------------------------------
-# run_hourly_jobs.py  – parallel INSERTs + progress tracking
-# ------------------------------------------------------------
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from google.cloud import bigquery
-from pathlib import Path
-import json
-import datetime
-import threading
-
-PROJECT_ID = "stl-datascience"
-DATASET    = "tomtom"
-SRC_TABLE  = f"`{PROJECT_ID}.{DATASET}.tt_bulk_test_geohash6`"
-DST_TABLE  = f"`{PROJECT_ID}.{DATASET}.tt_bulk_test_geohash6_hourly`"
-PFX_FILE   = Path("prefixes.json")
-DONE_FILE  = Path("processed_prefixes.json")
-MAX_WORKERS = 32      # tune for your slot capacity
-
-# ----------------------------------------------------------------------
-# load prefix lists
-# ----------------------------------------------------------------------
-all_prefixes = json.loads(PFX_FILE.read_text())
-processed = json.loads(DONE_FILE.read_text()) if DONE_FILE.exists() else []
-todo = [p for p in all_prefixes if p not in processed]
-
-print(f"{len(all_prefixes)} total prefixes, {len(processed)} done, {len(todo)} to run.")
-
-# ----------------------------------------------------------------------
-# BigQuery template (identical business logic, param @pfx)
-# ----------------------------------------------------------------------
-TEMPLATE_SQL = f\"\"\"                     -- (same body as before)
+TEMPLATE_SQL = f"""
 INSERT INTO {DST_TABLE}
+(dsegId, geohash, dateHour, sampleSize,
+ avgSpeedMetersPerHour, harmSpeedMetersPerHour, speedPercentiles)
 SELECT
   outer_q.dsegId,
   outer_q.geohash,
-  outer_q.date_hr                        AS dateHour,
+  outer_q.date_hr                                          AS dateHour,
   outer_q.sampleSize,
-  CAST(ROUND(outer_q.avgSpeed_mph  * 1609.34) AS INT64) AS avgSpeedMetersPerHour,
-  CAST(ROUND(outer_q.harmSpeed_mph * 1609.34) AS INT64) AS harmSpeedMetersPerHour,
+  CAST(ROUND(outer_q.avgSpeed_mph  * 1609.34) AS INT64)    AS avgSpeedMetersPerHour,
+  CAST(ROUND(outer_q.harmSpeed_mph * 1609.34) AS INT64)    AS harmSpeedMetersPerHour,
   CASE
-    WHEN ARRAY_LENGTH(outer_q.sims) = 0 THEN []
+    WHEN outer_q.sampleSize = 1 THEN []                    -- suppress meaningless array
     ELSE ARRAY(
       SELECT CAST(ROUND(p * 1609.34) AS INT64)
       FROM UNNEST(
@@ -97,7 +38,7 @@ FROM (
     SELECT
       base.dsegId,
       base.geohash,
-      TIMESTAMP_TRUNC(base.dateHour,HOUR)                 AS date_hr,
+      TIMESTAMP_TRUNC(base.dateHour, HOUR)                AS date_hr,
       base.sampleSize                                     AS n,
       base.averageSpeedMetersPerHour  / 1609.34           AS v_arith_mph,
       base.harmonicAverageSpeedMetersPerHour / 1609.34    AS v_harm_mph,
@@ -126,39 +67,8 @@ FROM (
     FROM {SRC_TABLE} AS base
     WHERE base.dateHour >= TIMESTAMP('2025-01-01')
       AND base.dateHour <  TIMESTAMP('2025-02-01')
-      AND SUBSTR(base.geohash, 1, 2) = @pfx
+      AND geohash LIKE CONCAT(@pfx, '%')                  -- cluster-friendly filter
   ) AS mid_q
   GROUP BY mid_q.dsegId, mid_q.geohash, mid_q.date_hr
 ) AS outer_q
-\"\"\"  # noqa: E501
-
-client = bigquery.Client(project=PROJECT_ID)
-lock = threading.Lock()   # guard updates to processed list + file
-
-def run_job(pfx: str):
-    job_cfg = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("pfx", "STRING", pfx)],
-        write_disposition="WRITE_APPEND",
-    )
-    job = client.query(TEMPLATE_SQL, job_config=job_cfg)
-    job.result()  # wait
-    with lock:
-        processed.append(pfx)
-        DONE_FILE.write_text(json.dumps(processed, indent=2))
-    return pfx, job.num_dml_affected_rows or 0
-
-start = datetime.datetime.utcnow()
-print(f\"{start:%H:%M:%S} – launching {len(todo)} jobs with {MAX_WORKERS} workers…\")
-
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-    futures = {pool.submit(run_job, p): p for p in todo}
-    for fut in as_completed(futures):
-        pfx = futures[fut]
-        try:
-            pfx, rows = fut.result()
-            elapsed = (datetime.datetime.utcnow() - start).seconds
-            print(f\"[{elapsed:4}s] ✔ {pfx} – {rows} rows appended\")
-        except Exception as exc:
-            print(f\"✖ {pfx} – {exc}\")
-
-print(\"Done. Processed prefixes list updated →\", DONE_FILE.resolve())
+"""
