@@ -54,3 +54,14 @@ for c in $(az storage container list --account-name "$ACCOUNT" --sas-token "$SAS
     --query "[?contains(name, 'incident')].name" -o tsv |
   sed 's#/[^/]*$#/#' | sort -u | sed "s#^#${c}/#"
 done
+
+
+
+CONTAINER="put-the-container-name-here"
+
+# Search for 'incident' within that container
+az storage blob list \
+  --account-name "$ACCOUNT" \
+  --container-name "$CONTAINER" \
+  --sas-token "$SAS" \
+  --query "[?contains(to_string(name), 'incident')].[name]" -o tsv
