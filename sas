@@ -1,3 +1,25 @@
+# Install prerequisites
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl apt-transport-https lsb-release gnupg
+
+# Add Microsoft package signing key + repo
+curl -sL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > microsoft.gpg
+sudo install -o root -g root -m 644 microsoft.gpg /etc/apt/trusted.gpg.d/
+AZ_REPO=$(lsb_release -cs)
+echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO main" | \
+  sudo tee /etc/apt/sources.list.d/azure-cli.list
+rm microsoft.gpg
+
+sudo apt-get update
+sudo apt-get install -y azure-cli
+
+az --version
+
+
+
+
+
+
 #!/bin/bash
 # --- SET THESE VARIABLES ---
 ACCOUNT="sldbatchprod"
